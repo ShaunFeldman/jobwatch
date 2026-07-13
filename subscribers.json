@@ -1,0 +1,28 @@
+{
+  "_readme": "One entry per person. companies: list of board names from config.json, or ['all']. filters: optional per-user override \u2014 any key omitted falls back to the global filters in config.json; set a key to '' to disable that filter for this user. Delivery: discord_webhook (Server Settings > Integrations > Webhooks > New Webhook > Copy URL) and/or telegram_chat_id (create a bot with @BotFather, have the friend message it once, read chat id from api.telegram.org/bot<TOKEN>/getUpdates; export TELEGRAM_BOT_TOKEN on the server). mute: true disables a user without deleting them.",
+  "shaun": {
+    "companies": [
+      "all"
+    ],
+    "filters": {
+      "location": "(new york|nyc|toronto|seattle|chicago|remote|united states|canada)"
+    },
+    "discord_webhook": "env:DISCORD_WEBHOOK_SHAUN",
+    "telegram_chat_id": ""
+  },
+  "friend_example": {
+    "companies": [
+      "stripe",
+      "databricks",
+      "ramp",
+      "plaid"
+    ],
+    "filters": {
+      "include": "(intern|new ?grad)",
+      "location": "(toronto|vancouver|remote|canada)"
+    },
+    "discord_webhook": "",
+    "telegram_chat_id": "",
+    "mute": true
+  }
+}
