@@ -1,0 +1,34 @@
+name: jobwatch
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jobwatch
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: run one cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: python watcher.py --once
+      - name: persist state
+        run: |
+          git config user.name "jobwatch"
+          git config user.email "jobwatch@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "state $(date -u +%FT%TZ)" && git push
