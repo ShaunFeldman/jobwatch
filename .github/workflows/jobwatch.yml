@@ -20,11 +20,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests
+          cache: pip
+      - run: pip install -r requirements.txt
       - name: run one cycle
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
         run: python watcher.py --once
       - name: persist state
         run: |

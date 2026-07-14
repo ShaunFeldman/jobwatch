@@ -1,12 +1,16 @@
 {
-  "_readme": "One entry per person. companies: list of board names from config.json, or ['all']. filters: optional per-user override \u2014 any key omitted falls back to the global filters in config.json; set a key to '' to disable that filter for this user. Delivery: discord_webhook (Server Settings > Integrations > Webhooks > New Webhook > Copy URL) and/or telegram_chat_id (create a bot with @BotFather, have the friend message it once, read chat id from api.telegram.org/bot<TOKEN>/getUpdates; export TELEGRAM_BOT_TOKEN on the server). mute: true disables a user without deleting them.",
+  "_readme": "One entry per person. companies: list of board names from config.json, or ['all']. filters: optional per-user override — any key omitted falls back to the global filters in config.json; set a key to '' to disable that filter for this user. watchlist: optional regex matched against company AND title — hits arrive as a separate gold 🔥 embed ahead of the normal batch. discord_mention: optional raw mention string (e.g. '<@123456789>' — your Discord user id) pinged on watchlist hits. ops: true → get an alert when a board has been failing 10+ polls. digest: true → daily 📊 summary at digest_hour_utc (config.json). Delivery: discord_webhook — use 'env:SECRET_NAME' and store the actual webhook URL as a GitHub Actions secret (Settings > Secrets and variables > Actions) so it never sits in the repo; a raw URL also works but is visible to anyone with repo access. Get the URL from Server Settings > Integrations > Webhooks. telegram_chat_id: create a bot with @BotFather, have the friend message it once, read chat id from api.telegram.org/bot<TOKEN>/getUpdates; export TELEGRAM_BOT_TOKEN on the server. mute: true disables a user without deleting them.",
   "shaun": {
     "companies": [
       "all"
     ],
     "filters": {
-      "location": "(new york|nyc|toronto|seattle|chicago|remote|united states|canada)"
+      "location": "(new york|nyc|brooklyn|jersey city|toronto|seattle|bellevue|redmond|chicago|evanston|remote|hybrid|united states|canada|\\bNY\\b|\\bWA\\b|\\bIL\\b|\\bON\\b)"
     },
+    "watchlist": "(jane street|citadel|hudson river|\\bhrt\\b|jump trading|two sigma|optiver|\\bimc\\b|\\bdrw\\b|five rings|radix|openai|anthropic|deepmind|stripe|databricks|nvidia)",
+    "discord_mention": "",
+    "ops": true,
+    "digest": true,
     "discord_webhook": "env:DISCORD_WEBHOOK_SHAUN",
     "telegram_chat_id": ""
   },

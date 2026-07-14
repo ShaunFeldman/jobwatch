@@ -87,7 +87,7 @@ def fetch_lever(cfg):
 
 
 def fetch_ashby(cfg):
-    url = f"https://api.ashbyhq.com/posting-api/job-board/{cfg['token']}?includeCompensation=false"
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{cfg['token']}?includeCompensation=true"
     r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
     r.raise_for_status()
     return [{
@@ -95,6 +95,7 @@ def fetch_ashby(cfg):
         "title": j.get("title", ""),
         "location": j.get("location", "") or "",
         "url": j.get("jobUrl", ""),
+        "salary": (j.get("compensation") or {}).get("compensationTierSummary", ""),
     } for j in r.json().get("jobs", [])]
 
 
@@ -264,45 +265,53 @@ def fetch_linkedin(cfg):
     Datacenter IPs get rate-limited sometimes; failures are quiet by design."""
     queries = cfg.get("queries") or [cfg.get("query", "software engineer intern")]
     location = cfg.get("location", "United States")
-    out, seen = [], set()
+    out, seen, errors = [], set(), []
     for q in queries:
-        start = 0
-        for _ in range(cfg.get("pages", 3)):
-            r = requests.get(
-                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
-                params={"keywords": q, "location": location,
-                        "f_TPR": cfg.get("recency", "r86400"), "start": start},
-                headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-                timeout=TIMEOUT)
-            if r.status_code in (400, 404):     # past the end of results
-                break
-            r.raise_for_status()
-            cards = r.text.split("<li")[1:]
-            got = 0
-            for card in cards:
-                m = re.search(r"urn:li:jobPosting:(\d+)", card)
-                mt = re.search(r"base-search-card__title[^>]*>\s*([^<]+)", card)
-                if not m or not mt:
-                    continue
-                got += 1
-                jid = m.group(1)
-                if jid in seen:
-                    continue
-                seen.add(jid)
-                mc = re.search(r"base-search-card__subtitle[^>]*>\s*<a[^>]*>\s*([^<]+)", card)
-                ml = re.search(r"job-search-card__location[^>]*>\s*([^<]+)", card)
-                out.append({
-                    "id": jid,
-                    "title": html.unescape(mt.group(1)).strip(),
-                    "location": html.unescape(ml.group(1)).strip() if ml else "",
-                    "url": f"https://www.linkedin.com/jobs/view/{jid}",
-                    "company": html.unescape(mc.group(1)).strip() if mc else "",
-                })
-            if not got:
-                break
-            start += got
-            time.sleep(1.0)                     # be polite, one IP
+        try:
+            _linkedin_query(cfg, q, location, out, seen)
+        except Exception as e:      # one rate-limited query shouldn't kill the rest
+            errors.append(e)
+    if not out and errors:
+        raise errors[0]
     return out
+
+
+def _linkedin_query(cfg, q, location, out, seen):
+    start = 0
+    for _ in range(cfg.get("pages", 3)):
+        r = requests.get(
+            "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+            params={"keywords": q, "location": location,
+                    "f_TPR": cfg.get("recency", "r86400"), "start": start},
+            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=TIMEOUT)
+        if r.status_code in (400, 404):         # past the end of results
+            break
+        r.raise_for_status()
+        got = 0
+        for card in r.text.split("<li")[1:]:
+            m = re.search(r"urn:li:jobPosting:(\d+)", card)
+            mt = re.search(r"base-search-card__title[^>]*>\s*([^<]+)", card)
+            if not m or not mt:
+                continue
+            got += 1
+            jid = m.group(1)
+            if jid in seen:
+                continue
+            seen.add(jid)
+            mc = re.search(r"base-search-card__subtitle[^>]*>\s*<a[^>]*>\s*([^<]+)", card)
+            ml = re.search(r"job-search-card__location[^>]*>\s*([^<]+)", card)
+            out.append({
+                "id": jid,
+                "title": html.unescape(mt.group(1)).strip(),
+                "location": html.unescape(ml.group(1)).strip() if ml else "",
+                "url": f"https://www.linkedin.com/jobs/view/{jid}",
+                "company": html.unescape(mc.group(1)).strip() if mc else "",
+            })
+        if not got:
+            break
+        start += got
+        time.sleep(1.0)                         # be polite, one IP
 
 
 def fetch_eightfold(cfg):
@@ -363,6 +372,10 @@ def db_open():
         key TEXT PRIMARY KEY, ts TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS sends(
         ts TEXT, subscriber TEXT, board TEXT, job_id TEXT, ok INTEGER)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS recent(
+        ts TEXT, company TEXT, title TEXT, url TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS kv(
+        k TEXT PRIMARY KEY, v TEXT)""")
     return con
 
 
@@ -382,12 +395,16 @@ def board_row(con, board):
 # ---- portable state (GitHub Actions mode) ----
 def export_state(con):
     state = {"boards": {}, "alerted": []}
-    for board, seeded, last_poll in con.execute(
-            "SELECT board, seeded, last_poll FROM boards"):
+    for board, seeded, last_poll, failures in con.execute(
+            "SELECT board, seeded, last_poll, failures FROM boards"):
         ids = sorted(known_ids(con, board))
         state["boards"][board] = {"seeded": seeded, "ids": ids,
-                                  "lp": int(last_poll or 0)}
+                                  "lp": int(last_poll or 0),
+                                  "f": failures or 0}
     state["alerted"] = [r[0] for r in con.execute("SELECT key FROM alerted")]
+    state["recent"] = [list(r) for r in con.execute(
+        "SELECT ts, company, title, url FROM recent")]
+    state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
     tmp.replace(STATE_JSON)
@@ -397,13 +414,19 @@ def import_state(con):
     state = json.loads(STATE_JSON.read_text())
     ts = now()
     for board, b in state.get("boards", {}).items():
-        con.execute("INSERT OR REPLACE INTO boards(board, seeded, last_poll) "
-                    "VALUES (?,?,?)", (board, b.get("seeded", 1), b.get("lp", 0)))
+        con.execute(
+            "INSERT OR REPLACE INTO boards(board, seeded, last_poll, failures) "
+            "VALUES (?,?,?,?)",
+            (board, b.get("seeded", 1), b.get("lp", 0), b.get("f", 0)))
         con.executemany(
             "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?,?)",
             [(board, i, "", "", "", ts, ts) for i in b.get("ids", [])])
     con.executemany("INSERT OR IGNORE INTO alerted VALUES (?,?)",
                     [(k, ts) for k in state.get("alerted", [])])
+    con.executemany("INSERT INTO recent VALUES (?,?,?,?)",
+                    [tuple(r) for r in state.get("recent", [])])
+    con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
+                    list(state.get("kv", {}).items()))
     con.commit()
     log(f"imported state.json: {len(state.get('boards', {}))} boards")
 
@@ -470,6 +493,17 @@ class Filt:
         return True
 
 
+def _resolve_secret(v):
+    """'env:NAME' in subscribers.json reads NAME from the environment, so
+    webhook URLs never live in the repo (GitHub Actions secrets)."""
+    if isinstance(v, str) and v.startswith("env:"):
+        name = v[4:]
+        v = os.environ.get(name, "")
+        if not v:
+            log(f"! secret {name} not set — delivery channel disabled")
+    return v
+
+
 def load_subscribers(global_filters):
     subs = json.loads(SUBSCRIBERS.read_text())
     out = []
@@ -480,7 +514,11 @@ def load_subscribers(global_filters):
             "name": name,
             "companies": set(s.get("companies", ["all"])),
             "filt": Filt(s.get("filters", {}), fallback=global_filters),
-            "discord": s.get("discord_webhook", ""),
+            "watch": Filt._c(s.get("watchlist", "")),
+            "mention": s.get("discord_mention", ""),
+            "ops": bool(s.get("ops")),
+            "digest": bool(s.get("digest")),
+            "discord": _resolve_secret(s.get("discord_webhook", "")),
             "telegram_chat": str(s.get("telegram_chat_id", "") or ""),
         })
     return out
@@ -545,6 +583,9 @@ def _discord_blocks(jobs):
             line = f"{_tag(j['title'])} [{title}]({j['url']})"
             if loc:
                 line += f" · {loc}"
+            sal = (j.get("salary") or "").strip()
+            if sal:
+                line += f" · 💰 {sal[:40]}"
             lines.append(line)
         blocks.append("\n".join(lines))
     return blocks
@@ -570,24 +611,39 @@ def _pack(blocks, limit):
     return out
 
 
-def send_discord(webhook, jobs):
+def send_discord(webhook, jobs, hot=False, mention=""):
     """One embed per message: markdown job links grouped under bold company
-    names. Embeds don't unfurl, so no link-preview spam."""
+    names. Embeds don't unfurl, so no link-preview spam. hot=True renders
+    the gold watchlist variant (and pings `mention` if set)."""
     descs = _pack(_discord_blocks(jobs), 3500)   # embed desc limit is 4096
     ts = datetime.now(timezone.utc).isoformat()
     n = len(jobs)
     ok = True
     for i, desc in enumerate(descs):
-        title = f"🆕 {n} new job{'s' if n != 1 else ''}"
+        if hot:
+            title = f"🔥 {n} watchlist match{'es' if n != 1 else ''}"
+        else:
+            title = f"🆕 {n} new job{'s' if n != 1 else ''}"
         if len(descs) > 1:
             title += f"  ·  {i + 1}/{len(descs)}"
         payload = {"embeds": [{"title": title, "description": desc,
-                               "color": 0x5865F2, "timestamp": ts,
+                               "color": 0xF1C40F if hot else 0x5865F2,
+                               "timestamp": ts,
                                "footer": {"text": "jobwatch"}}]}
+        if hot and mention and i == 0:
+            payload["content"] = mention
         ok &= _post_with_retry(
             lambda p=payload: requests.post(webhook, json=p, timeout=10),
             "discord")
     return ok
+
+
+def send_discord_note(webhook, title, desc, color):
+    """Single small embed for digests / ops notices."""
+    payload = {"embeds": [{"title": title, "description": desc[:3900],
+                           "color": color, "footer": {"text": "jobwatch"}}]}
+    return _post_with_retry(
+        lambda: requests.post(webhook, json=payload, timeout=10), "discord")
 
 
 def send_telegram(chat_id, text):
@@ -633,15 +689,77 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
+    watch = sub.get("watch")
+    hot = [(b, j) for b, j in jobs
+           if watch and (watch.search(j.get("company") or b)
+                         or watch.search(j["title"]))]
+    rest = [t for t in jobs if t not in hot]
     ok = True
     if sub["discord"]:
-        ok &= send_discord(sub["discord"], jobs)
+        if hot:
+            ok &= send_discord(sub["discord"], hot, hot=True,
+                               mention=sub.get("mention", ""))
+        if rest:
+            ok &= send_discord(sub["discord"], rest)
     if sub["telegram_chat"]:
-        ok &= send_telegram(sub["telegram_chat"], _telegram_text(jobs))
+        text = _telegram_text(jobs)
+        if hot:
+            text = ("🔥 watchlist: "
+                    + ", ".join(j.get("company") or b for b, j in hot)
+                    + "\n\n" + text)
+        ok &= send_telegram(sub["telegram_chat"], text)
     for b, j in jobs:
         con.execute("INSERT INTO sends VALUES (?,?,?,?,?)",
                     (now(), sub["name"], b, j["id"], int(ok)))
     return ok
+
+
+def maybe_digest(config, con, subs):
+    """Once a day (after digest_hour_utc), send subscribers with digest:true a
+    summary of the last 24h — doubles as an is-it-alive heartbeat."""
+    hour = config.get("digest_hour_utc")
+    if hour is None:
+        return
+    now_dt = datetime.now(timezone.utc)
+    if now_dt.hour < hour:
+        return
+    today = now_dt.date().isoformat()
+    row = con.execute("SELECT v FROM kv WHERE k='last_digest'").fetchone()
+    if row and row[0] >= today:
+        return
+    con.execute("INSERT OR REPLACE INTO kv VALUES ('last_digest', ?)", (today,))
+
+    rows = con.execute(
+        "SELECT company, COUNT(*) FROM recent WHERE ts > datetime('now','-1 day') "
+        "GROUP BY company ORDER BY COUNT(*) DESC, company").fetchall()
+    total = sum(n for _, n in rows)
+    n_boards = con.execute(
+        "SELECT COUNT(*) FROM boards WHERE seeded=1").fetchone()[0]
+    broken = [b for (b,) in con.execute(
+        "SELECT board FROM boards WHERE failures >= 10 ORDER BY board")]
+
+    if rows:
+        top = "\n".join(f"• **{c}** — {n}" for c, n in rows[:10])
+        more = f"\n…plus {len(rows) - 10} more companies" if len(rows) > 10 else ""
+        desc = (f"**{total}** new job{'s' if total != 1 else ''} across "
+                f"**{len(rows)}** compan{'ies' if len(rows) != 1 else 'y'} "
+                f"in the last 24h:\n{top}{more}")
+    else:
+        desc = "Quiet day — no new matching jobs in the last 24h."
+    desc += f"\n\nWatching {n_boards} boards."
+    if broken:
+        desc += f"\n⚠️ failing: {', '.join(broken)}"
+
+    for sub in subs:
+        if not sub["digest"]:
+            continue
+        if sub["discord"]:
+            send_discord_note(sub["discord"], f"📊 daily digest — {today}",
+                              desc, 0x2ECC71)
+        if sub["telegram_chat"]:
+            send_telegram(sub["telegram_chat"],
+                          f"📊 daily digest — {today}\n\n"
+                          + desc.replace("**", ""))
 
 
 # ================================================================ core cycle
@@ -658,6 +776,7 @@ def cycle(config, con):
                   if not k.startswith("_") and not v.get("disabled")}
     subs = load_subscribers(config.get("filters", {}))
     new_by_board = {}
+    broke = []
     ok_count = fail_count = skipped = 0
 
     # respect per-board min_interval (big feeds like the 11MB listings repos
@@ -683,6 +802,8 @@ def cycle(config, con):
                 failures += 1
                 con.execute("UPDATE boards SET failures=? WHERE board=?", (failures, name))
                 fail_count += 1
+                if failures == 10:      # persisted streak → fires once per outage
+                    broke.append((name, type(e).__name__))
                 if failures in (1, 3, 10) or failures % 50 == 0:
                     log(f"! {name}: {type(e).__name__}: {e} (streak {failures})")
                 continue
@@ -741,14 +862,31 @@ def cycle(config, con):
 
     # mark every gated job as alerted (even if no subscriber matched, so a
     # later echo from another source can't ping something already evaluated)
+    ts = now()
     for board, jobs in gated.items():
         for j in jobs:
             mark_alerted(con, j)
+            con.execute("INSERT INTO recent VALUES (?,?,?,?)",
+                        (ts, j.get("company") or board.replace("_", " "),
+                         j["title"], j["url"]))
+
+    if broke:
+        detail = ", ".join(f"{n} ({err})" for n, err in broke)
+        for sub in subs:
+            if sub["ops"] and sub["discord"]:
+                send_discord_note(
+                    sub["discord"], "⚠️ jobwatch: board trouble",
+                    f"{len(broke)} board(s) failing 10 polls in a row: {detail}\n"
+                    f"Check the token / run `python watcher.py --verify`.",
+                    0xE74C3C)
+
+    maybe_digest(config, con, subs)
 
     con.execute("DELETE FROM jobs WHERE last_seen < datetime('now', ?)",
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM alerted WHERE ts < datetime('now', ?)",
                 (f"-{PRUNE_AFTER_DAYS} days",))
+    con.execute("DELETE FROM recent WHERE ts < datetime('now', '-2 days')")
     con.commit()
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
@@ -824,6 +962,9 @@ def cmd_test(config, who):
     sub = next((s for s in subs if s["name"] == who), None)
     if not sub:
         sys.exit(f"no active subscriber '{who}'")
+    if not sub["discord"] and not sub["telegram_chat"]:
+        sys.exit(f"'{who}' has no delivery channel — if the webhook is an "
+                 f"env: secret, export it first")
     fake = [
         ("test", {"id": "t0", "company": "jobwatch",
                   "title": "test message — delivery works, sample layout below",

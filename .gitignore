@@ -1,0 +1,3 @@
+jobwatch.db
+__pycache__/
+.watcher.lock
