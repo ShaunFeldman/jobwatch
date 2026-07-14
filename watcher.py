@@ -4,9 +4,9 @@ jobwatch v4 — multi-user, multi-source job posting watcher.
 
 Sources: Greenhouse / Lever / Ashby / SmartRecruiters / Workday / Eightfold
 boards, amazon.jobs, Microsoft careers, LinkedIn guest search, community
-GitHub listing repos (SimplifyJobs / vanshb03 / cvrve JSON, jobright-ai
-markdown). Cross-source dedupe so the same job never pings twice.
-Discord delivery uses embeds grouped by company (no link-preview spam).
+GitHub listing repos (SimplifyJobs / vanshb03 / cvrve JSON + markdown-table
+repos like speedyapply). Cross-source dedupe so the same job never pings
+twice. Discord delivery uses embeds grouped by company (no link-preview spam).
 
     pip install requests
     python watcher.py --check            # validate config + regexes
@@ -219,42 +219,79 @@ def fetch_github_listings(cfg):
     return out
 
 
-def fetch_jobright(cfg):
-    """jobright-ai README repos — LinkedIn-sourced listings refreshed daily,
-    published as a markdown table. cfg: repo ('jobright-ai/2026-Software-
-    Engineer-Internship'), branch (default 'master'), path (default 'README.md').
-    Row shape: | **[Company](site)** | **[Title](jobright.ai/jobs/info/ID?utm)** | Location | ..."""
-    repo = cfg["repo"]
-    branch = cfg.get("branch", "master")
-    path = cfg.get("path", "README.md")
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_MD_IMG = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_HREF = re.compile(r'href="(https?://[^"]+)"')
+_RAW_URL = re.compile(r"https?://[^)\s\"'<>\]]+")
+_HTML_TAG = re.compile(r"<[^>]+>")
+_DECOR = re.compile(r"[✓✅🆕🔥⭐🎯🛂🔒🇺🇸🇨🇦↳*_`]")
+
+
+def _cell_text(cell):
+    s = _MD_IMG.sub("", cell)
+    m = _MD_LINK.search(s)
+    if m and m.group(1).strip():
+        s = m.group(1)
+    else:
+        s = _HTML_TAG.sub("", s)
+    s = _DECOR.sub("", s)
+    return re.sub(r"\s+", " ", s).strip(" -—")
+
+
+def _cell_url(cell):
+    s = _MD_IMG.sub("", cell)       # shields.io badges hide the real link
+    m = _HREF.search(s)
+    if m:
+        return m.group(1)
+    m = _RAW_URL.search(s)
+    return m.group(0).rstrip(".,;") if m else ""
+
+
+def fetch_github_md(cfg):
+    """Community listing repos that publish a markdown table (speedyapply,
+    Canadian lists, off-season lists, ...). cfg: repo, branch (default 'main'),
+    path (default 'README.md'), cols: 0-based column indexes for
+    company/title/url (+ optional location/salary). Handles md links, HTML
+    anchors, shields.io Apply badges, and repos that repeat/omit the company
+    on continuation rows."""
+    cols = cfg["cols"]
+    url = (f"https://raw.githubusercontent.com/{cfg['repo']}/"
+           f"{cfg.get('branch', 'main')}/{cfg.get('path', 'README.md')}")
     r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
     r.raise_for_status()
-    link = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
-    out, prev_company = [], ""
+    need = max(cols.values()) + 1
+    out, seen, prev_company = [], set(), ""
     for row in r.text.splitlines():
         if not row.startswith("|"):
             continue
         cells = [c.strip() for c in row.strip().strip("|").split("|")]
-        if len(cells) < 3 or cells[0] in ("Company", "-----") or set(cells[0]) <= {"-", " "}:
+        if len(cells) < need:
             continue
-        mt = link.search(cells[1])
-        if not mt:
+        title = _cell_text(cells[cols["title"]])
+        if (not title or set(title) <= set("-: ")
+                or title.lower() in ("role", "position", "job title")):
+            continue                     # header / separator rows
+        joburl = _cell_url(cells[cols["url"]]) or _cell_url(cells[cols["title"]])
+        if not joburl:
             continue
-        mc = link.search(cells[0])
-        company = mc.group(1) if mc else cells[0].strip("*↳ ").strip()
-        company = company or prev_company
+        company = _cell_text(cells[cols["company"]]) or prev_company
         prev_company = company
-        joburl = mt.group(2).split("?")[0]
-        jid = (joburl.rsplit("/info/", 1)[-1] if "/info/" in joburl
-               else hashlib.md5(joburl.encode()).hexdigest()[:16])
-        out.append({
+        jid = hashlib.md5(joburl.encode()).hexdigest()[:16]
+        if jid in seen:
+            continue
+        seen.add(jid)
+        job = {
             "id": jid,
-            "title": mt.group(1).strip("* "),
-            "location": cells[2],
+            "title": title,
+            "location": _cell_text(cells[cols["location"]]) if "location" in cols else "",
             "url": joburl,
             "company": company,
-        })
+        }
+        if "salary" in cols:
+            sal = _cell_text(cells[cols["salary"]])
+            if sal and sal != "-":
+                job["salary"] = sal
+        out.append(job)
     return out
 
 
@@ -352,7 +389,7 @@ ADAPTERS = {
     "amazon_jobs": fetch_amazon_jobs,
     "microsoft": fetch_microsoft,
     "github_listings": fetch_github_listings,
-    "jobright": fetch_jobright,
+    "github_md": fetch_github_md,
     "linkedin": fetch_linkedin,
     "eightfold": fetch_eightfold,
 }
@@ -560,6 +597,13 @@ def _tag(title):
     return "💼"
 
 
+def _short_loc(loc):
+    """Trim noisy country suffixes for display ('Austin, TX, United States'
+    -> 'Austin, TX'). Filters still see the full string."""
+    return re.sub(r"\s*,?\s*(united states of america|united states|usa)\s*$",
+                  "", (loc or "").strip(), flags=re.I)
+
+
 def _group(jobs):
     """[(board, job)] -> [(company, [job])], companies A-Z, titles A-Z."""
     groups = {}
@@ -577,7 +621,7 @@ def _discord_blocks(jobs):
             title = j["title"].replace("[", "(").replace("]", ")").strip()
             if len(title) > 100:
                 title = title[:97] + "…"
-            loc = (j["location"] or "").strip()
+            loc = _short_loc(j["location"])
             if len(loc) > 45:
                 loc = loc[:42] + "…"
             line = f"{_tag(j['title'])} [{title}]({j['url']})"
@@ -680,7 +724,7 @@ def _telegram_text(jobs):
     for company, js in _group(jobs):
         lines = [f"— {company} —"]
         for j in js:
-            loc = (j["location"] or "").strip()
+            loc = _short_loc(j["location"])
             lines.append(f"{_tag(j['title'])} {j['title']}"
                          + (f" · {loc}" if loc else ""))
             lines.append(f"   {j['url']}")
@@ -831,15 +875,22 @@ def cycle(config, con):
                 new_by_board[name] = fresh
 
     # ---- cross-source dedupe gate (same job via ATS + repo = one alert)
-    total_new = deduped = 0
+    excl_co = Filt._c((config.get("filters") or {}).get("exclude_companies"))
+    total_new = deduped = agencies = 0
     gated = {}
+    seen_keys = set()               # same job from two sources in ONE cycle
     for board, jobs in new_by_board.items():
         keep = []
         for j in jobs:
             total_new += 1
-            if already_alerted(con, j):
+            if excl_co and excl_co.search(j.get("company") or ""):
+                agencies += 1       # staffing-agency spam: drop, don't alert
+                continue
+            ks = dedupe_keys(j)
+            if already_alerted(con, j) or any(k in seen_keys for k in ks):
                 deduped += 1
                 continue
+            seen_keys.update(ks)
             keep.append(j)
         if keep:
             gated[board] = keep
@@ -890,8 +941,8 @@ def cycle(config, con):
     con.commit()
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
-        f"{total_new} new, {deduped} cross-source dupes, {delivered} deliveries | "
-        f"{time.time()-t0:.1f}s")
+        f"{total_new} new, {deduped} cross-source dupes, {agencies} agency-spam, "
+        f"{delivered} deliveries | {time.time()-t0:.1f}s")
 
     hc = os.environ.get("HEALTHCHECK_URL", config.get("healthcheck_url", ""))
     if hc and (ok_count > 0):
@@ -906,6 +957,7 @@ def cmd_check(config):
     errs = 0
     try:
         Filt(config.get("filters", {}))
+        Filt._c(config.get("filters", {}).get("exclude_companies"))
     except re.error as e:
         print(f"✗ global filters: bad regex: {e}")
         errs += 1
@@ -923,6 +975,7 @@ def cmd_check(config):
         n_subs += 1
         try:
             Filt(s.get("filters", {}), fallback=config.get("filters", {}))
+            Filt._c(s.get("watchlist", ""))
         except re.error as e:
             print(f"✗ subscriber {name}: bad regex: {e}")
             errs += 1

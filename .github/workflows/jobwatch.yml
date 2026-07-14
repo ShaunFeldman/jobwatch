@@ -1,7 +1,11 @@
 name: jobwatch
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # offset minutes: GitHub sheds scheduled runs hardest at :00 spikes.
+    # NOTE: schedule is best-effort — expect 10-60 min in practice. For true
+    # every-10-min delivery, ping the workflow_dispatch endpoint from an
+    # external cron (cron-job.org) or run watcher.py in loop mode on a VPS.
+    - cron: "6,16,26,36,46,56 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -21,6 +25,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: require delivery secret
+        env:
+          DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_SHAUN" ]; then
+            echo "::error::Repo secret DISCORD_WEBHOOK_SHAUN is not set (Settings → Secrets and variables → Actions). Failing so alerts aren't silently dropped."
+            exit 1
+          fi
       - run: pip install -r requirements.txt
       - name: run one cycle
         env:

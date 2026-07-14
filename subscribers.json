@@ -7,10 +7,10 @@
     "filters": {
       "location": "(new york|nyc|brooklyn|jersey city|toronto|seattle|bellevue|redmond|chicago|evanston|remote|hybrid|united states|canada|\\bNY\\b|\\bWA\\b|\\bIL\\b|\\bON\\b)"
     },
-    "watchlist": "(jane street|citadel|hudson river|\\bhrt\\b|jump trading|two sigma|optiver|\\bimc\\b|\\bdrw\\b|five rings|radix|openai|anthropic|deepmind|stripe|databricks|nvidia)",
+    "watchlist": "(jane street|citadel|hudson river|\\bhrt\\b|jump trading|two sigma|optiver|\\bimc\\b|\\bdrw\\b|five rings|point72|millennium|d\\.? ?e\\.? ?shaw|susquehanna|\\bsig\\b|akuna|belvedere|virtu|xtx|\\bqube\\b|squarepoint|balyasny|schonfeld|bridgewater|\\baqr\\b|tower research|\\bpdt\\b|voleon|old mission|flow traders|radix|google|deepmind|\\bmeta\\b|\\bapple\\b|amazon|microsoft|netflix|nvidia|openai|anthropic|\\bxai\\b|tesla|tiktok|bytedance|stripe|databricks|figma|airbnb|\\buber\\b|lyft|doordash|roblox|palantir|snowflake|cloudflare|datadog|spacex|anduril|salesforce|coinbase|\\bramp\\b|plaid|brex|scale ai|perplexity|cursor|anysphere|vercel|notion|robinhood|goldman|morgan stanley|jp ?morgan|blackrock|blackstone|bloomberg|mastercard|american express|capital one)",
     "discord_mention": "",
     "ops": true,
-    "digest": true,
+    "digest": false,
     "discord_webhook": "env:DISCORD_WEBHOOK_SHAUN",
     "telegram_chat_id": ""
   },

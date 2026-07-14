@@ -1,9 +1,15 @@
 # jobwatch
 
 Personal job-posting watcher for 2026 internships / new-grad SWE + quant roles.
-Polls ~110 sources every 10 minutes via GitHub Actions and pings Discord
-(and/or Telegram) the moment something new appears — deduped across sources,
-grouped by company, no link-preview spam.
+Polls ~115 sources on a GitHub Actions cron and pings Discord (and/or
+Telegram) when something new appears — deduped across sources, grouped by
+company, staffing-agency spam filtered, no link-preview spam.
+
+> GitHub's `schedule` trigger is best-effort: on a private repo expect runs
+> every 10-60 min, not a guaranteed 10. For true near-real-time, hit the
+> `workflow_dispatch` endpoint from an external cron (cron-job.org +
+> fine-grained PAT), or run `python watcher.py` in loop mode on any
+> always-on box.
 
 ## Sources
 
@@ -14,7 +20,7 @@ grouped by company, no link-preview spam.
 | Eightfold | Netflix |
 | amazon.jobs | Amazon intern + SDE searches |
 | LinkedIn guest search | last-24h postings for SWE intern / new grad / quant queries (US + Canada) — no login needed |
-| GitHub listing repos | SimplifyJobs, vanshb03, cvrve (JSON) and jobright-ai (markdown, daily LinkedIn mirror) — covers Jane Street, Google, Meta, Apple, banks and hundreds more |
+| GitHub listing repos | SimplifyJobs, vanshb03, cvrve (JSON) + markdown-table repos: speedyapply (with salaries), Canadian-Tech-Internships-2026, off-season/Fall-2026 and Summer-2027 lists — covers Jane Street, Google, Meta, Apple, banks and hundreds more, all with direct apply links |
 
 ## How it works
 

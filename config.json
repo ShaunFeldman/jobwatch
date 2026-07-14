@@ -7,8 +7,9 @@
 
   "filters": {
     "include": "(intern|internship|new ?grad|graduate|university|campus|entry.level|early.career|20(26|27|28)|junior|quant|trader|research|software|\\bSWE\\b|developer|engineer|data scien|machine learning|\\bML\\b|\\bAI\\b)",
-    "exclude": "(senior|staff|principal|\\blead\\b|manager|director|\\bVP\\b|\\bII\\b|\\bIII\\b|\\bIV\\b|sales|recruit|marketing|account exec|solutions? (consult|architect)|customer success|support engineer|\\bHR\\b|payroll|legal|counsel|physician|nurse|technician|installer|warehouse|driver|mechanic|electrician)",
-    "location": ""
+    "exclude": "(senior|\\bsr\\b|staff|principal|\\blead\\b|manager|director|\\bVP\\b|\\bII\\b|\\bIII\\b|\\bIV\\b|sales|recruit|marketing|account exec|solutions? (consult|architect)|customer success|support engineer|\\bHR\\b|payroll|legal|counsel|physician|nurse|technician|installer|warehouse|driver|mechanic|electrician)",
+    "location": "",
+    "exclude_companies": "(selby jennings|anson mccade|harnham|oliver james|hunter bond|durlston|mondrian alpha|robert half|insight global|cybercoders|jobot|actalent|aerotek|teksystems|randstad|michael page|phaidon|glocomms|\\bgqr\\b|averity|storm2|mthree|revolution technologies|motion recruitment|jefferson frank|nigel frank|franklin fitch|understanding recruitment|trilogy international|hamlyn williams|eames consulting|paragon alpha|algo capital|quant capital|barrington james|xcede|kdr talent|(recruit|staffing|talent) (group|partners|solutions|agency)|executive search)"
   },
 
   "boards": {
@@ -147,24 +148,33 @@
     "spotify":        { "ats": "lever",      "token": "spotify" },
     "servicenow":     { "ats": "smartrecruiters", "token": "ServiceNow" },
 
-    "_aggregators": "--- community repos: hundreds of companies incl. bespoke boards (Jane Street, Google, Meta, Apple, banks). This is the same firehose the IG job accounts repost from. jobright repos mirror LinkedIn postings daily. ---",
-    "simplify_newgrad":   { "ats": "github_listings", "repo": "SimplifyJobs/New-Grad-Positions", "min_interval": 600 },
-    "simplify_intern26":  { "ats": "github_listings", "repo": "SimplifyJobs/Summer2026-Internships", "min_interval": 600 },
-    "vansh_intern26":     { "ats": "github_listings", "repo": "vanshb03/Summer2026-Internships", "min_interval": 600 },
-    "vansh_intern27":     { "ats": "github_listings", "repo": "vanshb03/Summer2027-Internships", "min_interval": 600 },
-    "vansh_newgrad26":    { "ats": "github_listings", "repo": "vanshb03/New-Grad-2026", "min_interval": 600 },
-    "cvrve_newgrad":      { "ats": "github_listings", "repo": "cvrve/New-Grad", "min_interval": 600 },
+    "_aggregators": "--- community repos: hundreds of companies incl. bespoke boards (Jane Street, Google, Meta, Apple, banks). JSON repos use the Simplify listings format; markdown repos are parsed via github_md with per-repo column maps (cols = 0-based indexes). ---",
+    "simplify_newgrad":   { "ats": "github_listings", "repo": "SimplifyJobs/New-Grad-Positions", "min_interval": 300 },
+    "simplify_intern26":  { "ats": "github_listings", "repo": "SimplifyJobs/Summer2026-Internships", "min_interval": 300 },
+    "vansh_intern26":     { "ats": "github_listings", "repo": "vanshb03/Summer2026-Internships", "min_interval": 300 },
+    "vansh_intern27":     { "ats": "github_listings", "repo": "vanshb03/Summer2027-Internships", "min_interval": 300 },
+    "vansh_newgrad27":    { "ats": "github_listings", "repo": "vanshb03/New-Grad-2027", "min_interval": 300,
+                            "_note": "renamed from New-Grad-2026 — same repo, rolls forward each cycle" },
+    "cvrve_newgrad":      { "ats": "github_listings", "repo": "cvrve/New-Grad", "min_interval": 300 },
     "simplify_intern27":  { "ats": "github_listings", "repo": "SimplifyJobs/Summer2027-Internships", "min_interval": 600, "disabled": true,
                             "_note": "enable once this repo exists — 404s harmlessly until then" },
-    "jobright_swe_intern":  { "ats": "jobright", "repo": "jobright-ai/2026-Software-Engineer-Internship", "min_interval": 900 },
-    "jobright_swe_newgrad": { "ats": "jobright", "repo": "jobright-ai/2026-Software-Engineer-New-Grad", "min_interval": 900 },
+    "speedy_swe":         { "ats": "github_md", "repo": "speedyapply/2027-SWE-College-Jobs", "min_interval": 600,
+                            "cols": { "company": 0, "title": 1, "location": 2, "salary": 3, "url": 4 } },
+    "speedy_ai":          { "ats": "github_md", "repo": "speedyapply/2027-AI-College-Jobs", "min_interval": 600,
+                            "cols": { "company": 0, "title": 1, "location": 2, "salary": 3, "url": 4 } },
+    "canada_intern26":    { "ats": "github_md", "repo": "negarprh/Canadian-Tech-Internships-2026", "min_interval": 600,
+                            "cols": { "company": 0, "title": 1, "location": 2, "url": 3 } },
+    "offseason_fall26":   { "ats": "github_md", "repo": "zshah101/Automated-List-Of-Summer-2027-and-Fall-2026-Tech-Internships", "min_interval": 600,
+                            "cols": { "company": 0, "title": 1, "location": 3, "url": 5 } },
+    "sndsh_intern27":     { "ats": "github_md", "repo": "sndsh404/summer-2027-internships", "min_interval": 600,
+                            "cols": { "company": 0, "title": 1, "location": 2, "url": 3 } },
 
     "_linkedin": "--- LinkedIn guest search (same postings as linkedin.com/jobs, posted in last 24h). Datacenter IPs occasionally get rate-limited; failures are quiet and the next poll catches up. ---",
-    "linkedin_us":     { "ats": "linkedin", "location": "United States", "min_interval": 900,
-                         "queries": ["software engineer intern", "software engineer new grad", "2026 software engineer"] },
-    "linkedin_canada": { "ats": "linkedin", "location": "Canada", "min_interval": 900,
+    "linkedin_us":     { "ats": "linkedin", "location": "United States", "min_interval": 300,
+                         "queries": ["software engineer intern", "software engineer new grad", "software developer intern", "2026 software engineer", "machine learning intern"] },
+    "linkedin_canada": { "ats": "linkedin", "location": "Canada", "min_interval": 600,
                          "queries": ["software engineer intern", "software engineer new grad"] },
-    "linkedin_quant":  { "ats": "linkedin", "location": "United States", "min_interval": 1800,
-                         "queries": ["quantitative trading intern", "quantitative research intern"] }
+    "linkedin_quant":  { "ats": "linkedin", "location": "United States", "min_interval": 900,
+                         "queries": ["quantitative trading intern", "quantitative research intern", "quantitative trader 2026"] }
   }
 }
