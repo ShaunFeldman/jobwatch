@@ -310,6 +310,16 @@ def fetch_linkedin(cfg):
             errors.append(e)
     if not out and errors:
         raise errors[0]
+    # Repost filter: job ids are chronological, so an id far below the batch's
+    # newest while claiming to be <24h old is a repost/relist of a stale req.
+    # ~1.2M ids/day globally; 4M ≈ 3 days of slack for genuinely new posts.
+    if out:
+        watermark = max(int(j["id"]) for j in out)
+        drift = cfg.get("max_id_drift", 4_000_000)
+        keep = [j for j in out if watermark - int(j["id"]) <= drift]
+        if len(keep) < len(out):
+            log(f"  linkedin({location}): dropped {len(out) - len(keep)} repost(s) by id drift")
+        out = keep
     return out
 
 
@@ -478,13 +488,23 @@ def canon_url(url):
     return f"{host}{path}"
 
 
-def name_key(company, title):
-    c = re.sub(r"[^a-z0-9]+", "", (company or "").lower())
+_CO_NOISE = re.compile(r"\(.*?\)|\b(incorporated|corporation|company|inc|llc|ltd|corp|co)\b\.?",
+                       re.I)
+
+
+def name_key(company, title, normalize=False):
+    c = company or ""
+    if normalize:               # 'Stripe, Inc.' / 'Stripe (YC S10)' -> 'Stripe'
+        c = _CO_NOISE.sub("", c)
+    c = re.sub(r"[^a-z0-9]+", "", c.lower())
     t = re.sub(r"[^a-z0-9]+", "", (title or "").lower())
     return f"nk:{c}|{t}" if c and t else ""
 
 
 def dedupe_keys(job):
+    """LinkedIn hides direct apply URLs from guests, so a LinkedIn posting and
+    its ATS twin never share a URL — company|title keys (exact + normalized
+    company) do the cross-source matching instead."""
     ks = []
     cu = canon_url(job.get("url", ""))
     if cu:
@@ -492,6 +512,9 @@ def dedupe_keys(job):
     nk = name_key(job.get("company", ""), job.get("title", ""))
     if nk:
         ks.append(nk)
+    nk2 = name_key(job.get("company", ""), job.get("title", ""), normalize=True)
+    if nk2 and nk2 != nk:
+        ks.append(nk2)
     return ks
 
 
@@ -879,7 +902,11 @@ def cycle(config, con):
     total_new = deduped = agencies = 0
     gated = {}
     seen_keys = set()               # same job from two sources in ONE cycle
-    for board, jobs in new_by_board.items():
+    # direct boards first so when LinkedIn and the company's own ATS surface
+    # the same job in one cycle, the alert carries the direct apply link
+    ordered = sorted(new_by_board.items(),
+                     key=lambda kv: all_boards.get(kv[0], {}).get("ats") == "linkedin")
+    for board, jobs in ordered:
         keep = []
         for j in jobs:
             total_new += 1

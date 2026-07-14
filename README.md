@@ -26,7 +26,7 @@ company, staffing-agency spam filtered, no link-preview spam.
 | Workday | NVIDIA, Salesforce, Adobe, Capital One, Intel, PayPal, Mastercard, Disney — `*_early` boards use tenant facet ids to see **every** Intern / University / New College Grad req server-side |
 | Eightfold | Netflix |
 | amazon.jobs | Amazon intern + SDE searches |
-| LinkedIn guest search | last-24h postings for SWE intern / new grad / quant queries (US + Canada) — no login needed |
+| LinkedIn guest search | last-24h postings for SWE intern / new grad / quant queries (US + Canada) — no login needed. Reposts/relists are dropped via id-drift (job ids are chronological; an old id claiming to be hours old is a repost). Staffing-agency posts are filtered by the `exclude_companies` regex. |
 | GitHub listing repos | SimplifyJobs, vanshb03, cvrve (JSON) + markdown-table repos: speedyapply (with salaries), Canadian-Tech-Internships-2026, off-season/Fall-2026 and Summer-2027 lists — covers Jane Street, Google, Meta, Apple, banks and hundreds more, all with direct apply links |
 
 ## How it works
