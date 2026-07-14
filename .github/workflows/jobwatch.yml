@@ -1,14 +1,16 @@
 name: jobwatch
 on:
   schedule:
-    # offset minutes: GitHub sheds scheduled runs hardest at :00 spikes.
-    # Each run then polls in a ~25-min loop (below), so even a shed schedule
-    # slot leaves no coverage gap as long as runs fire at least every ~25 min.
+    # Dead-man restart only: each successful run dispatches its own successor
+    # (see "chain next run"), so coverage doesn't depend on this best-effort
+    # scheduler. If the chain breaks (a run fails), the next cron slot that
+    # actually fires restarts it.
     - cron: "6,16,26,36,46,56 * * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: jobwatch
@@ -52,3 +54,12 @@ jobs:
             [ $SECONDS -ge $END ] && break
             sleep 150
           done
+      - name: chain next run
+        if: success()
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/jobwatch.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "successor dispatched"
