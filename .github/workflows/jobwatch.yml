@@ -2,9 +2,8 @@ name: jobwatch
 on:
   schedule:
     # offset minutes: GitHub sheds scheduled runs hardest at :00 spikes.
-    # NOTE: schedule is best-effort — expect 10-60 min in practice. For true
-    # every-10-min delivery, ping the workflow_dispatch endpoint from an
-    # external cron (cron-job.org) or run watcher.py in loop mode on a VPS.
+    # Each run then polls in a ~25-min loop (below), so even a shed schedule
+    # slot leaves no coverage gap as long as runs fire at least every ~25 min.
     - cron: "6,16,26,36,46,56 * * * *"
   workflow_dispatch: {}
 
@@ -18,7 +17,7 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,15 +33,22 @@ jobs:
             exit 1
           fi
       - run: pip install -r requirements.txt
-      - name: run one cycle
+      - name: poll loop (~25 min of coverage per run, cycle every ~4 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
-        run: python watcher.py --once
-      - name: persist state
         run: |
           git config user.name "jobwatch"
           git config user.email "jobwatch@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "state $(date -u +%FT%TZ)" && git push
+          END=$((SECONDS + 1500))
+          while true; do
+            python watcher.py --once
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "state $(date -u +%FT%TZ)"
+              git pull --rebase origin main && git push || echo "push failed, retrying next cycle"
+            fi
+            [ $SECONDS -ge $END ] && break
+            sleep 150
+          done

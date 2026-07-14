@@ -5,37 +5,18 @@ Polls ~115 sources on a GitHub Actions cron and pings Discord (and/or
 Telegram) when something new appears — deduped across sources, grouped by
 company, staffing-agency spam filtered, no link-preview spam.
 
-> GitHub's `schedule` trigger is best-effort: expect runs every 10-60 min,
-> not a guaranteed 10. See **Making it run often** below for the fix.
-
-## Making it run often (no server needed)
-
-`schedule:` runs get shed under load; `workflow_dispatch` runs start within
-seconds. And private repos cap free Actions minutes (~2,000/mo — every-10-min
-polling needs ~8,000), while public repos get unlimited. So:
-
-1. **Rotate the Discord webhook** (old URL lives in old commits): Discord →
-   Server Settings → Integrations → Webhooks → delete + recreate.
-2. **Update the secret**: repo Settings → Secrets and variables → Actions →
-   `DISCORD_WEBHOOK_SHAUN` = new URL.
-3. **Make the repo public**: Settings → General → Danger Zone. (Do 1-2 first.)
-4. **Fine-grained PAT**: github.com Settings → Developer settings →
-   Fine-grained tokens → access to this repo only, permission
-   *Actions: Read and write*.
-5. **cron-job.org** (free): POST every 5-10 min to
-   `https://api.github.com/repos/ShaunFeldman/jobwatch/actions/workflows/jobwatch.yml/dispatches`
-   with body `{"ref":"main"}` and headers
-   `Authorization: Bearer <PAT>` + `Accept: application/vnd.github+json`.
-
-The cron schedule stays as a fallback; the concurrency group stops runs from
-overlapping. Equivalent test from a terminal:
-
-```bash
-curl -X POST -H "Authorization: Bearer <PAT>" \
-  -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/ShaunFeldman/jobwatch/actions/workflows/jobwatch.yml/dispatches \
-  -d '{"ref":"main"}'
-```
+> **Cadence design**: GitHub's `schedule` trigger is best-effort (runs get
+> shed under load), so each run polls in a **~25-minute loop**, cycling every
+> ~4 minutes and pushing state after each cycle. The repo is public (Actions
+> minutes are free/unlimited), the concurrency group queues runs back-to-back,
+> and scheduler gaps under ~25 min cost nothing. Webhook URLs live only in
+> Actions secrets (`DISCORD_WEBHOOK_SHAUN`), never in the repo.
+>
+> Optional extra teeth: have an external cron (e.g. cron-job.org + a
+> fine-grained PAT with *Actions: write*) POST every 10 min to
+> `https://api.github.com/repos/ShaunFeldman/jobwatch/actions/workflows/jobwatch.yml/dispatches`
+> with body `{"ref":"main"}` — dispatched runs start within seconds even when
+> the scheduler is shedding.
 
 ## Sources
 
