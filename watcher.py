@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-jobwatch v3 — multi-user, multi-source job posting watcher.
+jobwatch v4 — multi-user, multi-source job posting watcher.
 
-Sources: Greenhouse / Lever / Ashby / SmartRecruiters / Workday boards,
-amazon.jobs, Microsoft careers, and community GitHub listing repos
-(SimplifyJobs etc). Cross-source dedupe so the same job never pings twice.
+Sources: Greenhouse / Lever / Ashby / SmartRecruiters / Workday / Eightfold
+boards, amazon.jobs, Microsoft careers, LinkedIn guest search, community
+GitHub listing repos (SimplifyJobs / vanshb03 / cvrve JSON, jobright-ai
+markdown). Cross-source dedupe so the same job never pings twice.
+Discord delivery uses embeds grouped by company (no link-preview spam).
 
     pip install requests
     python watcher.py --check            # validate config + regexes
@@ -20,6 +22,8 @@ Env: TELEGRAM_BOT_TOKEN, HEALTHCHECK_URL (optional).
 """
 
 import argparse
+import hashlib
+import html
 import json
 import os
 import random
@@ -114,7 +118,7 @@ def fetch_smartrecruiters(cfg):
 def fetch_workday(cfg):
     host, tenant, site = cfg["host"], cfg["tenant"], cfg["site"]
     url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    out, offset = [], 0
+    out, offset, total = [], 0, None
     while True:
         body = {"appliedFacets": cfg.get("facets", {}), "limit": 20,
                 "offset": offset, "searchText": cfg.get("search", "")}
@@ -123,6 +127,8 @@ def fetch_workday(cfg):
                                    "Content-Type": "application/json"})
         r.raise_for_status()
         data = r.json()
+        if total is None:       # many tenants only report total on page one
+            total = data.get("total", 0)
         posts = data.get("jobPostings", [])
         for j in posts:
             path = j.get("externalPath", "")
@@ -133,7 +139,7 @@ def fetch_workday(cfg):
                 "url": f"https://{host}/en-US/{site}{path}",
             })
         offset += 20
-        if not posts or offset >= data.get("total", 0) or offset >= 300:
+        if not posts or offset >= total or offset >= 300:
             break
     return out
 
@@ -212,6 +218,122 @@ def fetch_github_listings(cfg):
     return out
 
 
+def fetch_jobright(cfg):
+    """jobright-ai README repos — LinkedIn-sourced listings refreshed daily,
+    published as a markdown table. cfg: repo ('jobright-ai/2026-Software-
+    Engineer-Internship'), branch (default 'master'), path (default 'README.md').
+    Row shape: | **[Company](site)** | **[Title](jobright.ai/jobs/info/ID?utm)** | Location | ..."""
+    repo = cfg["repo"]
+    branch = cfg.get("branch", "master")
+    path = cfg.get("path", "README.md")
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+    r.raise_for_status()
+    link = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+    out, prev_company = [], ""
+    for row in r.text.splitlines():
+        if not row.startswith("|"):
+            continue
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        if len(cells) < 3 or cells[0] in ("Company", "-----") or set(cells[0]) <= {"-", " "}:
+            continue
+        mt = link.search(cells[1])
+        if not mt:
+            continue
+        mc = link.search(cells[0])
+        company = mc.group(1) if mc else cells[0].strip("*↳ ").strip()
+        company = company or prev_company
+        prev_company = company
+        joburl = mt.group(2).split("?")[0]
+        jid = (joburl.rsplit("/info/", 1)[-1] if "/info/" in joburl
+               else hashlib.md5(joburl.encode()).hexdigest()[:16])
+        out.append({
+            "id": jid,
+            "title": mt.group(1).strip("* "),
+            "location": cells[2],
+            "url": joburl,
+            "company": company,
+        })
+    return out
+
+
+def fetch_linkedin(cfg):
+    """LinkedIn public guest search — same postings as linkedin.com/jobs, no
+    login. cfg: queries (list) or query, location ('United States'), recency
+    ('r86400' = posted in last 24h), pages (default 3, ~10 results/page).
+    Datacenter IPs get rate-limited sometimes; failures are quiet by design."""
+    queries = cfg.get("queries") or [cfg.get("query", "software engineer intern")]
+    location = cfg.get("location", "United States")
+    out, seen = [], set()
+    for q in queries:
+        start = 0
+        for _ in range(cfg.get("pages", 3)):
+            r = requests.get(
+                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+                params={"keywords": q, "location": location,
+                        "f_TPR": cfg.get("recency", "r86400"), "start": start},
+                headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                timeout=TIMEOUT)
+            if r.status_code in (400, 404):     # past the end of results
+                break
+            r.raise_for_status()
+            cards = r.text.split("<li")[1:]
+            got = 0
+            for card in cards:
+                m = re.search(r"urn:li:jobPosting:(\d+)", card)
+                mt = re.search(r"base-search-card__title[^>]*>\s*([^<]+)", card)
+                if not m or not mt:
+                    continue
+                got += 1
+                jid = m.group(1)
+                if jid in seen:
+                    continue
+                seen.add(jid)
+                mc = re.search(r"base-search-card__subtitle[^>]*>\s*<a[^>]*>\s*([^<]+)", card)
+                ml = re.search(r"job-search-card__location[^>]*>\s*([^<]+)", card)
+                out.append({
+                    "id": jid,
+                    "title": html.unescape(mt.group(1)).strip(),
+                    "location": html.unescape(ml.group(1)).strip() if ml else "",
+                    "url": f"https://www.linkedin.com/jobs/view/{jid}",
+                    "company": html.unescape(mc.group(1)).strip() if mc else "",
+                })
+            if not got:
+                break
+            start += got
+            time.sleep(1.0)                     # be polite, one IP
+    return out
+
+
+def fetch_eightfold(cfg):
+    """Eightfold-powered career sites (Netflix etc). cfg: host
+    ('explore.jobs.netflix.net'), domain ('netflix.com'), optional query."""
+    out, start = [], 0
+    while start < cfg.get("max", 100):      # API serves 10 per page
+        params = {"domain": cfg["domain"], "start": start, "num": 10,
+                  "sort_by": "timestamp"}
+        if cfg.get("query"):
+            params["query"] = cfg["query"]
+        r = requests.get(f"https://{cfg['host']}/api/apply/v2/jobs", params=params,
+                         headers={"User-Agent": UA, "Accept": "application/json"},
+                         timeout=TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        positions = data.get("positions", [])
+        for p in positions:
+            out.append({
+                "id": str(p.get("id")),
+                "title": p.get("name", ""),
+                "location": p.get("location", "") or "",
+                "url": p.get("canonicalPositionUrl")
+                       or f"https://{cfg['host']}/careers/job/{p.get('id')}",
+            })
+        start += len(positions)
+        if not positions or start >= data.get("count", 0):
+            break
+    return out
+
+
 ADAPTERS = {
     "greenhouse": fetch_greenhouse,
     "lever": fetch_lever,
@@ -221,6 +343,9 @@ ADAPTERS = {
     "amazon_jobs": fetch_amazon_jobs,
     "microsoft": fetch_microsoft,
     "github_listings": fetch_github_listings,
+    "jobright": fetch_jobright,
+    "linkedin": fetch_linkedin,
+    "eightfold": fetch_eightfold,
 }
 
 
@@ -257,9 +382,11 @@ def board_row(con, board):
 # ---- portable state (GitHub Actions mode) ----
 def export_state(con):
     state = {"boards": {}, "alerted": []}
-    for board, seeded in con.execute("SELECT board, seeded FROM boards"):
+    for board, seeded, last_poll in con.execute(
+            "SELECT board, seeded, last_poll FROM boards"):
         ids = sorted(known_ids(con, board))
-        state["boards"][board] = {"seeded": seeded, "ids": ids}
+        state["boards"][board] = {"seeded": seeded, "ids": ids,
+                                  "lp": int(last_poll or 0)}
     state["alerted"] = [r[0] for r in con.execute("SELECT key FROM alerted")]
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -270,8 +397,8 @@ def import_state(con):
     state = json.loads(STATE_JSON.read_text())
     ts = now()
     for board, b in state.get("boards", {}).items():
-        con.execute("INSERT OR REPLACE INTO boards(board, seeded) VALUES (?,?)",
-                    (board, b.get("seeded", 1)))
+        con.execute("INSERT OR REPLACE INTO boards(board, seeded, last_poll) "
+                    "VALUES (?,?,?)", (board, b.get("seeded", 1), b.get("lp", 0)))
         con.executemany(
             "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?,?)",
             [(board, i, "", "", "", ts, ts) for i in b.get("ids", [])])
@@ -382,11 +509,83 @@ def _post_with_retry(fn, what):
     return False
 
 
-def send_discord(webhook, text):
+# ---- rendering: group by company, tag by role type ----
+TAG_INTERN = re.compile(r"\bintern(ship)?\b", re.I)
+TAG_GRAD = re.compile(r"new ?grad|graduate|early career|university|campus|entry.level|junior", re.I)
+
+
+def _tag(title):
+    if TAG_INTERN.search(title):
+        return "🛠️"
+    if TAG_GRAD.search(title):
+        return "🎓"
+    return "💼"
+
+
+def _group(jobs):
+    """[(board, job)] -> [(company, [job])], companies A-Z, titles A-Z."""
+    groups = {}
+    for b, j in jobs:
+        groups.setdefault(j.get("company") or b.replace("_", " "), []).append(j)
+    return sorted(((c, sorted(js, key=lambda x: x["title"]))
+                   for c, js in groups.items()), key=lambda kv: kv[0].lower())
+
+
+def _discord_blocks(jobs):
+    blocks = []
+    for company, js in _group(jobs):
+        lines = [f"**{company}**"]
+        for j in js:
+            title = j["title"].replace("[", "(").replace("]", ")").strip()
+            if len(title) > 100:
+                title = title[:97] + "…"
+            loc = (j["location"] or "").strip()
+            if len(loc) > 45:
+                loc = loc[:42] + "…"
+            line = f"{_tag(j['title'])} [{title}]({j['url']})"
+            if loc:
+                line += f" · {loc}"
+            lines.append(line)
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _pack(blocks, limit):
+    """Pack company blocks into strings of at most `limit` chars."""
+    out, cur = [], ""
+    for b in blocks:
+        while len(b) > limit:           # a single huge company block
+            cut = b.rfind("\n", 0, limit)
+            if cut <= 0:
+                cut = limit
+            out.append(b[:cut])
+            b = b[cut:].lstrip("\n")
+        if cur and len(cur) + len(b) + 2 > limit:
+            out.append(cur)
+            cur = b
+        else:
+            cur = f"{cur}\n\n{b}" if cur else b
+    if cur:
+        out.append(cur)
+    return out
+
+
+def send_discord(webhook, jobs):
+    """One embed per message: markdown job links grouped under bold company
+    names. Embeds don't unfurl, so no link-preview spam."""
+    descs = _pack(_discord_blocks(jobs), 3500)   # embed desc limit is 4096
+    ts = datetime.now(timezone.utc).isoformat()
+    n = len(jobs)
     ok = True
-    for chunk in _chunks(text, 1900):
+    for i, desc in enumerate(descs):
+        title = f"🆕 {n} new job{'s' if n != 1 else ''}"
+        if len(descs) > 1:
+            title += f"  ·  {i + 1}/{len(descs)}"
+        payload = {"embeds": [{"title": title, "description": desc,
+                               "color": 0x5865F2, "timestamp": ts,
+                               "footer": {"text": "jobwatch"}}]}
         ok &= _post_with_retry(
-            lambda c=chunk: requests.post(webhook, json={"content": c}, timeout=10),
+            lambda p=payload: requests.post(webhook, json=p, timeout=10),
             "discord")
     return ok
 
@@ -420,16 +619,25 @@ def _chunks(s, n):
     return parts
 
 
+def _telegram_text(jobs):
+    parts = [f"🆕 {len(jobs)} new job{'s' if len(jobs) != 1 else ''}"]
+    for company, js in _group(jobs):
+        lines = [f"— {company} —"]
+        for j in js:
+            loc = (j["location"] or "").strip()
+            lines.append(f"{_tag(j['title'])} {j['title']}"
+                         + (f" · {loc}" if loc else ""))
+            lines.append(f"   {j['url']}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
 def deliver(sub, jobs, con):
-    lines = [f"🆕 {j.get('company') or b} | {j['title']}\n"
-             f"{j['location'] or 'location n/a'}\n{j['url']}"
-             for b, j in jobs]
-    text = "\n\n".join(lines)
     ok = True
     if sub["discord"]:
-        ok &= send_discord(sub["discord"], text)
+        ok &= send_discord(sub["discord"], jobs)
     if sub["telegram_chat"]:
-        ok &= send_telegram(sub["telegram_chat"], text)
+        ok &= send_telegram(sub["telegram_chat"], _telegram_text(jobs))
     for b, j in jobs:
         con.execute("INSERT INTO sends VALUES (?,?,?,?,?)",
                     (now(), sub["name"], b, j["id"], int(ok)))
@@ -616,9 +824,23 @@ def cmd_test(config, who):
     sub = next((s for s in subs if s["name"] == who), None)
     if not sub:
         sys.exit(f"no active subscriber '{who}'")
-    fake = [("test", {"id": "0", "company": "jobwatch",
-                      "title": "test message — delivery works",
-                      "location": "everywhere", "url": "https://example.com"})]
+    fake = [
+        ("test", {"id": "t0", "company": "jobwatch",
+                  "title": "test message — delivery works, sample layout below",
+                  "location": "everywhere", "url": "https://example.com"}),
+        ("test", {"id": "t1", "company": "Stripe",
+                  "title": "Software Engineer, Intern (Summer 2026)",
+                  "location": "New York, NY", "url": "https://example.com/1"}),
+        ("test", {"id": "t2", "company": "Stripe",
+                  "title": "Software Engineer, New Grad",
+                  "location": "Toronto, ON", "url": "https://example.com/2"}),
+        ("test", {"id": "t3", "company": "Anthropic",
+                  "title": "Software Engineer, 2026 Start",
+                  "location": "Remote — US", "url": "https://example.com/3"}),
+        ("test", {"id": "t4", "company": "Jane Street",
+                  "title": "Quantitative Trader — Summer Internship",
+                  "location": "New York, NY", "url": "https://example.com/4"}),
+    ]
     con = db_open()
     print("sent ok" if deliver(sub, fake, con) else "send FAILED — check webhook/token")
     con.commit()
