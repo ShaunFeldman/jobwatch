@@ -41,6 +41,7 @@ jobs:
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
           DISCORD_WEBHOOK_APPLY: ${{ secrets.DISCORD_WEBHOOK_APPLY }}
+          DISCORD_WEBHOOK_WATCHLIST: ${{ secrets.DISCORD_WEBHOOK_WATCHLIST }}
           DISCORD_WEBHOOK_INTERN: ${{ secrets.DISCORD_WEBHOOK_INTERN }}
           DISCORD_WEBHOOK_FULLTIME: ${{ secrets.DISCORD_WEBHOOK_FULLTIME }}
         run: |
@@ -57,14 +58,6 @@ jobs:
             [ $SECONDS -ge $END ] && break
             sleep 150
           done
-      - name: publish job board
-        run: |
-          python watcher.py --board
-          git add docs
-          if ! git diff --cached --quiet; then
-            git commit -m "board $(date -u +%FT%TZ)"
-            git pull --rebase origin main && git push || echo "board push failed"
-          fi
       - name: chain next run
         if: success()
         run: |

@@ -647,71 +647,81 @@ def _group(jobs):
                    for c, js in groups.items()), key=lambda kv: kv[0].lower())
 
 
-def _discord_blocks(jobs):
-    blocks = []
-    for company, js in _group(jobs):
-        lines = [f"**{company}**"]
-        for j in js:
-            title = j["title"].replace("[", "(").replace("]", ")").strip()
-            if len(title) > 100:
-                title = title[:97] + "…"
-            loc = _short_loc(j["location"])
-            if len(loc) > 45:
-                loc = loc[:42] + "…"
-            line = f"{_tag(j['title'])} [{title}]({j['url']})"
-            if loc:
-                line += f" · {loc}"
-            sal = (j.get("salary") or "").strip()
-            if sal:
-                line += f" · 💰 {sal[:40]}"
-            lines.append(line)
-        blocks.append("\n".join(lines))
-    return blocks
-
-
-def _pack(blocks, limit):
-    """Pack company blocks into strings of at most `limit` chars."""
-    out, cur = [], ""
-    for b in blocks:
-        while len(b) > limit:           # a single huge company block
-            cut = b.rfind("\n", 0, limit)
-            if cut <= 0:
-                cut = limit
-            out.append(b[:cut])
-            b = b[cut:].lstrip("\n")
-        if cur and len(cur) + len(b) + 2 > limit:
-            out.append(cur)
-            cur = b
-        else:
-            cur = f"{cur}\n\n{b}" if cur else b
-    if cur:
-        out.append(cur)
-    return out
-
-
-def send_discord(webhook, jobs, label, color, silent=False, mention=""):
-    """One embed per message: markdown job links grouped under bold company
-    names. Embeds don't unfurl, so no link-preview spam. label is a template
-    like '🛠️ {n} internship{s}'. silent=True sets Discord's @silent flag
-    (SUPPRESS_NOTIFICATIONS): the message lands in the channel to browse
-    later but never pushes a notification."""
-    descs = _pack(_discord_blocks(jobs), 3500)   # embed desc limit is 4096
+def send_discord_ping(webhook, jobs, kind, mention=""):
+    """The apply-now tier: one rich embed PER JOB (clickable title, location,
+    salary) so each ping is a self-contained application card. kind is
+    'internship' or 'new grad role'. The header line is plain content, so
+    pings are also findable via Discord search."""
+    color = 0xF1C40F if kind == "internship" else 0xE67E22
     ts = datetime.now(timezone.utc).isoformat()
     n = len(jobs)
+    header = f"🎯 **{n} watchlist {kind}{'s' if n != 1 else ''} just dropped**"
+    if mention:
+        header = f"{mention} {header}"
+    embeds = []
+    for b, j in jobs:
+        company = j.get("company") or b.replace("_", " ")
+        parts = []
+        loc = _short_loc(j["location"])
+        if loc:
+            parts.append(f"📍 {loc}")
+        sal = (j.get("salary") or "").strip()
+        if sal:
+            parts.append(f"💰 {sal[:60]}")
+        embeds.append({
+            "title": f"{company} — {j['title']}"[:256],
+            "url": j["url"],
+            "description": "\n".join(parts),
+            "color": color,
+            "timestamp": ts,
+            "footer": {"text": "jobwatch · react ✅ once you've applied"},
+        })
     ok = True
-    for i, desc in enumerate(descs):
-        title = label.format(n=n, s="s" if n != 1 else "")
-        if len(descs) > 1:
-            title += f"  ·  {i + 1}/{len(descs)}"
-        payload = {"embeds": [{"title": title, "description": desc,
-                               "color": color, "timestamp": ts,
-                               "footer": {"text": "jobwatch"}}]}
-        if silent:
-            payload["flags"] = 4096
-        if mention and not silent and i == 0:
-            payload["content"] = mention
+    for i in range(0, len(embeds), 10):     # 10 embeds max per message
+        payload = {"embeds": embeds[i:i + 10]}
+        if i == 0:
+            payload["content"] = header
         ok &= _post_with_retry(
             lambda p=payload: requests.post(webhook, json=p, timeout=10),
+            "discord")
+    return ok
+
+
+def send_discord_feed(webhook, header, jobs):
+    """Feed messages use plain content (not embeds) because Discord's search
+    only indexes message content — this makes the feed a searchable board
+    (`in:#channel stripe`). Links are <>-masked so nothing unfurls, and the
+    @silent flag (4096) + suppress-embeds flag (4) keep it quiet."""
+    lines = []
+    for company, js in _group(jobs):
+        for j in js:
+            title = j["title"].replace("[", "(").replace("]", ")").replace("`", "'").strip()
+            if len(title) > 90:
+                title = title[:87] + "…"
+            loc = _short_loc(j["location"])
+            if len(loc) > 40:
+                loc = loc[:37] + "…"
+            sal = (j.get("salary") or "").strip()[:40]
+            line = f"{_tag(j['title'])} **{company}** — [{title}](<{j['url']}>)"
+            if loc:
+                line += f" · {loc}"
+            if sal:
+                line += f" · 💰 {sal}"
+            lines.append(line)
+    ok = True
+    chunk = f"**{header}**"
+    chunks = []
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 1900:
+            chunks.append(chunk)
+            chunk = line
+        else:
+            chunk += "\n" + line
+    chunks.append(chunk)
+    for c in chunks:
+        ok &= _post_with_retry(
+            lambda p={"content": c, "flags": 4100}:
+                requests.post(webhook, json=p, timeout=10),
             "discord")
     return ok
 
@@ -767,21 +777,23 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
-    """Two tiers: jobs at watchlist companies that are intern/new-grad roles
-    PING (loud embed + optional mention); everything else lands @silent in a
-    browsable feed, split internships vs full-time. Per-tier webhooks route
-    to separate channels when configured; otherwise all use the main one."""
+    """Ping tier: jobs at watchlist companies that are intern/new-grad roles
+    (loud embed + optional mention). Everything else lands @silent as plain
+    searchable text — Discord IS the board: ⭐ other watchlist-company roles,
+    🛠️ internships, 💼 full-time. Per-tier webhooks route to separate
+    channels when configured; otherwise all use the main one."""
     watch = sub.get("watch")
-    tiers = {"ping_intern": [], "ping_grad": [], "feed_intern": [], "feed_ft": []}
+    tiers = {"ping_intern": [], "ping_grad": [], "feed_watch": [],
+             "feed_intern": [], "feed_ft": []}
     for b, j in jobs:
         cat = _category(j["title"])
-        # ping = a company he'd actually apply to AND an intern/new-grad role;
-        # match company only — titles like 'Salesforce Developer Intern' at a
-        # consultancy must not ping
-        hot = (watch and cat != "other"
-               and watch.search(j.get("company") or b))
-        if hot:
+        # watchlist matches company only — titles like 'Salesforce Developer
+        # Intern' at a consultancy must not count
+        hot = bool(watch and watch.search(j.get("company") or b))
+        if hot and cat != "other":
             tiers["ping_intern" if cat == "intern" else "ping_grad"].append((b, j))
+        elif hot:
+            tiers["feed_watch"].append((b, j))
         elif cat == "intern":
             tiers["feed_intern"].append((b, j))
         else:
@@ -789,23 +801,23 @@ def deliver(sub, jobs, con):
 
     main = sub["discord"]
     ping_hook = sub["ping_hook"] or main
-    feed_i = sub["feeds"].get("intern") or main
-    feed_ft = sub["feeds"].get("full_time") or main
     ok = True
     if tiers["ping_intern"] and ping_hook:
-        ok &= send_discord(ping_hook, tiers["ping_intern"],
-                           "🎯 apply now — {n} internship{s}", 0xF1C40F,
-                           mention=sub["mention"])
+        ok &= send_discord_ping(ping_hook, tiers["ping_intern"],
+                                "internship", mention=sub["mention"])
     if tiers["ping_grad"] and ping_hook:
-        ok &= send_discord(ping_hook, tiers["ping_grad"],
-                           "🎯 apply now — {n} new grad role{s}", 0xE67E22,
-                           mention=sub["mention"])
-    if tiers["feed_intern"] and feed_i:
-        ok &= send_discord(feed_i, tiers["feed_intern"],
-                           "🛠️ {n} internship{s}", 0x5865F2, silent=True)
-    if tiers["feed_ft"] and feed_ft:
-        ok &= send_discord(feed_ft, tiers["feed_ft"],
-                           "💼 {n} full-time role{s}", 0x95A5A6, silent=True)
+        ok &= send_discord_ping(ping_hook, tiers["ping_grad"],
+                                "new grad role", mention=sub["mention"])
+    feed_defs = [("feed_watch", "watchlist", "⭐ watchlist — {n} other role{s}"),
+                 ("feed_intern", "intern", "🛠️ {n} internship{s}"),
+                 ("feed_ft", "full_time", "💼 {n} full-time role{s}")]
+    for tier, hook_name, header in feed_defs:
+        items = tiers[tier]
+        hook = sub["feeds"].get(hook_name) or main
+        if items and hook:
+            n = len(items)
+            ok &= send_discord_feed(
+                hook, header.format(n=n, s="s" if n != 1 else ""), items)
     if sub["telegram_chat"]:
         text = _telegram_text(jobs)
         hot_cos = [j.get("company") or b
@@ -1019,75 +1031,6 @@ def cycle(config, con):
             pass
 
 
-# ================================================================ job board
-BOARD_TMPL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>jobwatch board</title>
-<style>
-:root{color-scheme:light dark;font-family:-apple-system,system-ui,Segoe UI,sans-serif}
-body{margin:0 auto;max-width:920px;padding:16px}
-h1{font-size:20px;margin:4px 0}.meta{opacity:.7;font-size:13px}
-#q{width:100%;box-sizing:border-box;padding:10px;font-size:15px;margin:12px 0 8px;border-radius:8px;border:1px solid #8886;background:transparent;color:inherit}
-.tabs button{padding:6px 14px;margin:0 6px 4px 0;border-radius:16px;border:1px solid #8886;background:transparent;color:inherit;cursor:pointer;font-size:13px}
-.tabs button.on{background:#5865F2;color:#fff;border-color:#5865F2}
-.day{margin:18px 0 4px;font-weight:700;font-size:13px;opacity:.75;text-transform:uppercase}
-.job{padding:7px 4px;border-bottom:1px solid #8883;font-size:14px;line-height:1.55}
-.job a{font-weight:600;text-decoration:none;color:#4e8cff}.job a:hover{text-decoration:underline}
-.co{font-weight:700}.loc,.sal{opacity:.7;font-size:13px}
-</style></head><body>
-<h1>jobwatch board</h1>
-<div class="meta">__N__ matched jobs · last __DAYS__ days · updated __UPDATED__ · auto-refreshes every ~30 min</div>
-<input id="q" placeholder="search company, title, location…">
-<div class="tabs"><button data-c="" class="on">All</button><button data-c="intern">🛠️ Internships</button><button data-c="ft">💼 Full-time</button></div>
-<div id="list"></div>
-<script>
-const JOBS=__DATA__;
-let cat="",q="";
-const esc=s=>{const d=document.createElement("span");d.textContent=s;return d.innerHTML};
-function render(){
- let h="",day="";
- for(const j of JOBS){
-  const c=j.cat==="intern"?"intern":"ft";
-  if(cat&&c!==cat)continue;
-  if(q&&!(j.company+" "+j.title+" "+j.loc).toLowerCase().includes(q))continue;
-  if(j.ts!==day){day=j.ts;h+=`<div class="day">${day}</div>`}
-  const tag=j.cat==="intern"?"🛠️":j.cat==="new_grad"?"🎓":"💼";
-  h+=`<div class="job">${tag} <span class="co">${esc(j.company)}</span> — <a href="${esc(j.url)}" target="_blank" rel="noopener">${esc(j.title)}</a>${j.loc?` <span class="loc">· ${esc(j.loc)}</span>`:""}${j.sal?` <span class="sal">· 💰 ${esc(j.sal)}</span>`:""}</div>`
- }
- document.getElementById("list").innerHTML=h||"<p>no matches</p>";
-}
-document.getElementById("q").addEventListener("input",e=>{q=e.target.value.toLowerCase();render()});
-document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("on"));b.classList.add("on");cat=b.dataset.c;render()}));
-render();
-</script></body></html>
-"""
-
-
-def cmd_board(con):
-    """Render docs/jobs.html — one searchable page of everything the watcher
-    matched in the last RECENT_DAYS days (served via GitHub Pages)."""
-    rows = con.execute(
-        "SELECT ts, company, title, url, location, salary FROM recent "
-        "ORDER BY ts DESC, company").fetchall()
-    seen, jobs = set(), []
-    for ts, company, title, url, location, salary in rows:
-        if url in seen:
-            continue
-        seen.add(url)
-        jobs.append({"ts": ts[:10], "company": company, "title": title,
-                     "url": url, "loc": _short_loc(location or ""),
-                     "sal": salary or "", "cat": _category(title)})
-    data = json.dumps(jobs, separators=(",", ":")).replace("</", "<\\/")
-    doc = (BOARD_TMPL.replace("__DATA__", data)
-           .replace("__N__", str(len(jobs)))
-           .replace("__DAYS__", str(RECENT_DAYS))
-           .replace("__UPDATED__", now()))
-    out = HERE / "docs" / "jobs.html"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(doc)
-    print(f"wrote {out} ({len(jobs)} jobs)")
-
-
 # ================================================================ cli
 def cmd_check(config):
     errs = 0
@@ -1187,8 +1130,6 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--list", metavar="BOARD")
     ap.add_argument("--test", metavar="SUBSCRIBER")
-    ap.add_argument("--board", action="store_true",
-                    help="render docs/jobs.html from the recent-jobs table")
     args = ap.parse_args()
 
     config = json.loads(Path(args.config).read_text())
@@ -1200,13 +1141,6 @@ def main():
         return
     if args.test:
         cmd_test(config, args.test)
-        return
-    if args.board:
-        fresh = not DB_PATH.exists()
-        con = db_open()
-        if fresh and STATE_JSON.exists():
-            import_state(con)
-        cmd_board(con)
         return
     if args.list:
         _, jobs = fetch_board(args.list, config["boards"][args.list])

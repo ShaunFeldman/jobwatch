@@ -42,16 +42,32 @@ company, staffing-agency spam filtered, no link-preview spam.
 - New boards seed silently — you're only alerted for jobs posted after the
   board was added.
 
-## Discord output
+## Discord output — Discord IS the board
 
-- 🆕 one embed per batch, jobs grouped under bold company names, each line
-  `🛠️/🎓/💼 [title](link) · location · 💰 salary`.
-- 🔥 watchlist matches (per-subscriber company/title regex) arrive first in a
-  gold embed, optionally pinging `discord_mention`.
-- 📊 daily digest at `digest_hour_utc` — last-24h counts by company, plus any
-  failing boards (subscribers with `digest: true`).
-- ⚠️ ops alert when a board fails 10 polls in a row (subscribers with
-  `ops: true`).
+Two tiers, four streams, each routable to its own channel (or all in one):
+
+- **🎯 apply-now pings** (loud, `ping_webhook`): jobs at watchlist companies
+  that are intern/new-grad roles. One rich embed per job — clickable title,
+  📍 location, 💰 salary — with `discord_mention` support so it actually
+  buzzes your phone. Footer nudges the workflow: **react ✅ once you've
+  applied**, and the channel doubles as your application tracker.
+- **⭐ watchlist feed** (silent, `feeds.watchlist`): every other role at
+  watchlist companies.
+- **🛠️ internships / 💼 full-time feeds** (silent, `feeds.intern` /
+  `feeds.full_time`): everything else, split by role type.
+
+Feed messages are plain text (not embeds) on purpose: Discord search only
+indexes message content, so `in:#internships stripe` filters the backlog
+instantly. Links are `<>`-masked — no preview spam — and carry the @silent
+flag, so feeds never notify.
+
+Recommended server layout: four channels (`#🎯apply-now`, `#⭐watchlist`,
+`#🛠️internships`, `#💼full-time`), one webhook each, stored as the Actions
+secrets `DISCORD_WEBHOOK_APPLY / _WATCHLIST / _INTERN / _FULLTIME`. Any
+unset secret falls back to the main channel.
+
+Also: 📊 daily digest at `digest_hour_utc` (subscribers with `digest: true`)
+and ⚠️ ops alerts when a board fails 10 polls in a row (`ops: true`).
 
 ## Commands
 
