@@ -35,6 +35,15 @@ jobs:
             exit 1
           fi
       - run: pip install -r requirements.txt
+      - name: restore state
+        # state lives on the force-pushed `state` branch so main stays clean
+        run: |
+          if git fetch origin state --depth 1; then
+            git checkout FETCH_HEAD -- state.json
+            echo "state restored from state branch"
+          else
+            echo "no state branch yet — first run seeds silently"
+          fi
       - name: poll loop (~25 min of coverage per run, cycle every ~4 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -50,10 +59,10 @@ jobs:
           END=$((SECONDS + 1500))
           while true; do
             python watcher.py --once
-            git add state.json
+            git add -f state.json
             if ! git diff --cached --quiet; then
               git commit -m "state $(date -u +%FT%TZ)"
-              git pull --rebase origin main && git push || echo "push failed, retrying next cycle"
+              git push -f origin HEAD:state || echo "state push failed, retrying next cycle"
             fi
             [ $SECONDS -ge $END ] && break
             sleep 150

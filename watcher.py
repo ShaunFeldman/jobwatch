@@ -362,6 +362,70 @@ def _linkedin_query(cfg, q, location, out, seen):
         time.sleep(1.0)                         # be polite, one IP
 
 
+def fetch_janestreet(cfg):
+    """Jane Street's own positions feed — no ATS, plain JSON. The
+    availability field ('Full-Time: New Grad', 'Internship', ...) is folded
+    into the title so intern/new-grad categorization and filters see it."""
+    r = requests.get("https://www.janestreet.com/jobs/main.json",
+                     headers={"User-Agent": UA, "Accept": "application/json"},
+                     timeout=TIMEOUT)
+    r.raise_for_status()
+    cities = {"NYC": "New York, NY", "LDN": "London, UK", "HKG": "Hong Kong",
+              "SGP": "Singapore", "AMS": "Amsterdam", "CHI": "Chicago, IL"}
+    out = []
+    for p in r.json():
+        avail = (p.get("availability") or "").strip()
+        title = p.get("position", "")
+        if avail and avail.lower() not in title.lower():
+            title = f"{title} — {avail}"
+        sal = ""
+        if p.get("min_salary") and p.get("max_salary"):
+            try:
+                lo = int(str(p["min_salary"]).replace(",", "").split(".")[0])
+                hi = int(str(p["max_salary"]).replace(",", "").split(".")[0])
+                sal = f"${lo:,} – ${hi:,}"
+            except ValueError:
+                sal = f"${p['min_salary']} – ${p['max_salary']}"
+        out.append({
+            "id": str(p.get("id")),
+            "title": title,
+            "location": cities.get(p.get("city"), p.get("city") or ""),
+            "url": f"https://www.janestreet.com/join-jane-street/position/{p.get('id')}/",
+            "company": "Jane Street",
+            "salary": sal,
+        })
+    return out
+
+
+def fetch_phenom(cfg):
+    """Phenom People career sites (jobs.rbc.com etc). cfg: host, query,
+    size (default 100), url ('https://host/xx/en/job/{id}' template)."""
+    body = {"lang": "en_us", "deviceType": "desktop", "country": "us",
+            "pageName": "search-results", "ddoKey": "refineSearch", "from": 0,
+            "jobs": True, "counts": True, "size": cfg.get("size", 100),
+            "clearAll": False, "jdsource": "facets", "siteType": "external",
+            "keywords": cfg.get("query", ""), "global": True,
+            "selected_fields": {}, "all_fields": ["category", "location"]}
+    r = requests.post(f"https://{cfg['host']}/widgets", json=body,
+                      headers={"User-Agent": UA, "Accept": "application/json",
+                               "Content-Type": "application/json"},
+                      timeout=TIMEOUT)
+    r.raise_for_status()
+    url_tmpl = cfg.get("url", f"https://{cfg['host']}/en/job/{{id}}")
+    out = []
+    for j in r.json().get("refineSearch", {}).get("data", {}).get("jobs", []):
+        jid = str(j.get("jobId") or j.get("reqId") or "")
+        loc = (j.get("cityStateCountry") or j.get("cityState")
+               or j.get("location") or j.get("city") or "")
+        out.append({
+            "id": jid,
+            "title": j.get("title", ""),
+            "location": loc if isinstance(loc, str) else "; ".join(loc[:3]),
+            "url": j.get("applyUrl") or url_tmpl.format(id=jid),
+        })
+    return out
+
+
 def fetch_eightfold(cfg):
     """Eightfold-powered career sites (Netflix etc). cfg: host
     ('explore.jobs.netflix.net'), domain ('netflix.com'), optional query."""
@@ -403,6 +467,8 @@ ADAPTERS = {
     "github_md": fetch_github_md,
     "linkedin": fetch_linkedin,
     "eightfold": fetch_eightfold,
+    "janestreet": fetch_janestreet,
+    "phenom": fetch_phenom,
 }
 
 

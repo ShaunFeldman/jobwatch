@@ -45,6 +45,18 @@
     "schonfeld":      { "ats": "greenhouse", "token": "schonfeld" },
     "qube_rt":        { "ats": "greenhouse", "token": "quberesearchandtechnologies" },
     "aqr":            { "ats": "greenhouse", "token": "aqr" },
+    "jane_street":    { "ats": "janestreet", "min_interval": 600,
+                        "_note": "their own positions JSON — direct, includes salary + New Grad/Internship availability" },
+    "worldquant":     { "ats": "greenhouse", "token": "worldquant" },
+
+    "_canadian_banks": "--- Workday boards; browse newest 300, filters trim. RBC is on Phenom (their own platform). ---",
+    "rbc":            { "ats": "phenom", "host": "jobs.rbc.com", "query": "software", "min_interval": 900,
+                        "url": "https://jobs.rbc.com/ca/en/job/{id}" },
+    "rbc_early":      { "ats": "phenom", "host": "jobs.rbc.com", "query": "intern", "min_interval": 900,
+                        "url": "https://jobs.rbc.com/ca/en/job/{id}" },
+    "td":             { "ats": "workday", "host": "td.wd3.myworkdayjobs.com", "tenant": "td", "site": "TD_Bank_Careers", "search": "", "min_interval": 1800 },
+    "bmo":            { "ats": "workday", "host": "bmo.wd3.myworkdayjobs.com", "tenant": "bmo", "site": "External", "search": "", "min_interval": 1800 },
+    "cibc":           { "ats": "workday", "host": "cibc.wd3.myworkdayjobs.com", "tenant": "cibc", "site": "search", "search": "", "min_interval": 1800 },
 
     "_fintech": "----------------------------------------",
     "stripe":         { "ats": "greenhouse", "token": "stripe" },
