@@ -46,7 +46,8 @@ STATE_JSON = HERE / "state.json"
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 TIMEOUT = 25
-PRUNE_AFTER_DAYS = 90
+PRUNE_AFTER_DAYS = 90   # dedupe memory: a job re-posted after this alerts again
+RECENT_DAYS = 14        # how far back the job-board page reaches
 ZERO_GUARD_MIN = 5
 SEND_RETRIES = 3
 
@@ -420,7 +421,8 @@ def db_open():
     con.execute("""CREATE TABLE IF NOT EXISTS sends(
         ts TEXT, subscriber TEXT, board TEXT, job_id TEXT, ok INTEGER)""")
     con.execute("""CREATE TABLE IF NOT EXISTS recent(
-        ts TEXT, company TEXT, title TEXT, url TEXT)""")
+        ts TEXT, company TEXT, title TEXT, url TEXT,
+        location TEXT DEFAULT '', salary TEXT DEFAULT '')""")
     con.execute("""CREATE TABLE IF NOT EXISTS kv(
         k TEXT PRIMARY KEY, v TEXT)""")
     return con
@@ -450,7 +452,7 @@ def export_state(con):
                                   "f": failures or 0}
     state["alerted"] = [r[0] for r in con.execute("SELECT key FROM alerted")]
     state["recent"] = [list(r) for r in con.execute(
-        "SELECT ts, company, title, url FROM recent")]
+        "SELECT ts, company, title, url, location, salary FROM recent")]
     state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -470,8 +472,9 @@ def import_state(con):
             [(board, i, "", "", "", ts, ts) for i in b.get("ids", [])])
     con.executemany("INSERT OR IGNORE INTO alerted VALUES (?,?)",
                     [(k, ts) for k in state.get("alerted", [])])
-    con.executemany("INSERT INTO recent VALUES (?,?,?,?)",
-                    [tuple(r) for r in state.get("recent", [])])
+    con.executemany("INSERT INTO recent VALUES (?,?,?,?,?,?)",
+                    [tuple(r) + ("",) * (6 - len(r))
+                     for r in state.get("recent", [])])
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
     con.commit()
@@ -553,13 +556,14 @@ class Filt:
         return True
 
 
-def _resolve_secret(v):
+def _resolve_secret(v, quiet=False):
     """'env:NAME' in subscribers.json reads NAME from the environment, so
-    webhook URLs never live in the repo (GitHub Actions secrets)."""
+    webhook URLs never live in the repo (GitHub Actions secrets). quiet=True
+    for optional per-tier hooks that silently fall back to the main one."""
     if isinstance(v, str) and v.startswith("env:"):
         name = v[4:]
         v = os.environ.get(name, "")
-        if not v:
+        if not v and not quiet:
             log(f"! secret {name} not set — delivery channel disabled")
     return v
 
@@ -579,6 +583,9 @@ def load_subscribers(global_filters):
             "ops": bool(s.get("ops")),
             "digest": bool(s.get("digest")),
             "discord": _resolve_secret(s.get("discord_webhook", "")),
+            "ping_hook": _resolve_secret(s.get("ping_webhook", ""), quiet=True),
+            "feeds": {k: _resolve_secret(v, quiet=True)
+                      for k, v in (s.get("feeds") or {}).items()},
             "telegram_chat": str(s.get("telegram_chat_id", "") or ""),
         })
     return out
@@ -607,17 +614,21 @@ def _post_with_retry(fn, what):
     return False
 
 
-# ---- rendering: group by company, tag by role type ----
-TAG_INTERN = re.compile(r"\bintern(ship)?\b", re.I)
+# ---- rendering: group by company, tag/tier by role type ----
+TAG_INTERN = re.compile(r"\bintern(ship)?\b|\bco.?op\b", re.I)
 TAG_GRAD = re.compile(r"new ?grad|graduate|early career|university|campus|entry.level|junior", re.I)
 
 
-def _tag(title):
+def _category(title):
     if TAG_INTERN.search(title):
-        return "🛠️"
+        return "intern"
     if TAG_GRAD.search(title):
-        return "🎓"
-    return "💼"
+        return "new_grad"
+    return "other"
+
+
+def _tag(title):
+    return {"intern": "🛠️", "new_grad": "🎓", "other": "💼"}[_category(title)]
 
 
 def _short_loc(loc):
@@ -678,26 +689,26 @@ def _pack(blocks, limit):
     return out
 
 
-def send_discord(webhook, jobs, hot=False, mention=""):
+def send_discord(webhook, jobs, label, color, silent=False, mention=""):
     """One embed per message: markdown job links grouped under bold company
-    names. Embeds don't unfurl, so no link-preview spam. hot=True renders
-    the gold watchlist variant (and pings `mention` if set)."""
+    names. Embeds don't unfurl, so no link-preview spam. label is a template
+    like '🛠️ {n} internship{s}'. silent=True sets Discord's @silent flag
+    (SUPPRESS_NOTIFICATIONS): the message lands in the channel to browse
+    later but never pushes a notification."""
     descs = _pack(_discord_blocks(jobs), 3500)   # embed desc limit is 4096
     ts = datetime.now(timezone.utc).isoformat()
     n = len(jobs)
     ok = True
     for i, desc in enumerate(descs):
-        if hot:
-            title = f"🔥 {n} watchlist match{'es' if n != 1 else ''}"
-        else:
-            title = f"🆕 {n} new job{'s' if n != 1 else ''}"
+        title = label.format(n=n, s="s" if n != 1 else "")
         if len(descs) > 1:
             title += f"  ·  {i + 1}/{len(descs)}"
         payload = {"embeds": [{"title": title, "description": desc,
-                               "color": 0xF1C40F if hot else 0x5865F2,
-                               "timestamp": ts,
+                               "color": color, "timestamp": ts,
                                "footer": {"text": "jobwatch"}}]}
-        if hot and mention and i == 0:
+        if silent:
+            payload["flags"] = 4096
+        if mention and not silent and i == 0:
             payload["content"] = mention
         ok &= _post_with_retry(
             lambda p=payload: requests.post(webhook, json=p, timeout=10),
@@ -756,24 +767,51 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
+    """Two tiers: jobs at watchlist companies that are intern/new-grad roles
+    PING (loud embed + optional mention); everything else lands @silent in a
+    browsable feed, split internships vs full-time. Per-tier webhooks route
+    to separate channels when configured; otherwise all use the main one."""
     watch = sub.get("watch")
-    hot = [(b, j) for b, j in jobs
-           if watch and (watch.search(j.get("company") or b)
-                         or watch.search(j["title"]))]
-    rest = [t for t in jobs if t not in hot]
-    ok = True
-    if sub["discord"]:
+    tiers = {"ping_intern": [], "ping_grad": [], "feed_intern": [], "feed_ft": []}
+    for b, j in jobs:
+        cat = _category(j["title"])
+        # ping = a company he'd actually apply to AND an intern/new-grad role;
+        # match company only — titles like 'Salesforce Developer Intern' at a
+        # consultancy must not ping
+        hot = (watch and cat != "other"
+               and watch.search(j.get("company") or b))
         if hot:
-            ok &= send_discord(sub["discord"], hot, hot=True,
-                               mention=sub.get("mention", ""))
-        if rest:
-            ok &= send_discord(sub["discord"], rest)
+            tiers["ping_intern" if cat == "intern" else "ping_grad"].append((b, j))
+        elif cat == "intern":
+            tiers["feed_intern"].append((b, j))
+        else:
+            tiers["feed_ft"].append((b, j))
+
+    main = sub["discord"]
+    ping_hook = sub["ping_hook"] or main
+    feed_i = sub["feeds"].get("intern") or main
+    feed_ft = sub["feeds"].get("full_time") or main
+    ok = True
+    if tiers["ping_intern"] and ping_hook:
+        ok &= send_discord(ping_hook, tiers["ping_intern"],
+                           "🎯 apply now — {n} internship{s}", 0xF1C40F,
+                           mention=sub["mention"])
+    if tiers["ping_grad"] and ping_hook:
+        ok &= send_discord(ping_hook, tiers["ping_grad"],
+                           "🎯 apply now — {n} new grad role{s}", 0xE67E22,
+                           mention=sub["mention"])
+    if tiers["feed_intern"] and feed_i:
+        ok &= send_discord(feed_i, tiers["feed_intern"],
+                           "🛠️ {n} internship{s}", 0x5865F2, silent=True)
+    if tiers["feed_ft"] and feed_ft:
+        ok &= send_discord(feed_ft, tiers["feed_ft"],
+                           "💼 {n} full-time role{s}", 0x95A5A6, silent=True)
     if sub["telegram_chat"]:
         text = _telegram_text(jobs)
-        if hot:
-            text = ("🔥 watchlist: "
-                    + ", ".join(j.get("company") or b for b, j in hot)
-                    + "\n\n" + text)
+        hot_cos = [j.get("company") or b
+                   for k in ("ping_intern", "ping_grad") for b, j in tiers[k]]
+        if hot_cos:
+            text = "🎯 apply now: " + ", ".join(hot_cos) + "\n\n" + text
         ok &= send_telegram(sub["telegram_chat"], text)
     for b, j in jobs:
         con.execute("INSERT INTO sends VALUES (?,?,?,?,?)",
@@ -944,9 +982,10 @@ def cycle(config, con):
     for board, jobs in gated.items():
         for j in jobs:
             mark_alerted(con, j)
-            con.execute("INSERT INTO recent VALUES (?,?,?,?)",
+            con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                         (ts, j.get("company") or board.replace("_", " "),
-                         j["title"], j["url"]))
+                         j["title"], j["url"], j.get("location") or "",
+                         j.get("salary") or ""))
 
     if broke:
         detail = ", ".join(f"{n} ({err})" for n, err in broke)
@@ -964,7 +1003,8 @@ def cycle(config, con):
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM alerted WHERE ts < datetime('now', ?)",
                 (f"-{PRUNE_AFTER_DAYS} days",))
-    con.execute("DELETE FROM recent WHERE ts < datetime('now', '-2 days')")
+    con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
+                (f"-{RECENT_DAYS} days",))
     con.commit()
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
@@ -977,6 +1017,75 @@ def cycle(config, con):
             requests.get(hc, timeout=10)
         except Exception:
             pass
+
+
+# ================================================================ job board
+BOARD_TMPL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jobwatch board</title>
+<style>
+:root{color-scheme:light dark;font-family:-apple-system,system-ui,Segoe UI,sans-serif}
+body{margin:0 auto;max-width:920px;padding:16px}
+h1{font-size:20px;margin:4px 0}.meta{opacity:.7;font-size:13px}
+#q{width:100%;box-sizing:border-box;padding:10px;font-size:15px;margin:12px 0 8px;border-radius:8px;border:1px solid #8886;background:transparent;color:inherit}
+.tabs button{padding:6px 14px;margin:0 6px 4px 0;border-radius:16px;border:1px solid #8886;background:transparent;color:inherit;cursor:pointer;font-size:13px}
+.tabs button.on{background:#5865F2;color:#fff;border-color:#5865F2}
+.day{margin:18px 0 4px;font-weight:700;font-size:13px;opacity:.75;text-transform:uppercase}
+.job{padding:7px 4px;border-bottom:1px solid #8883;font-size:14px;line-height:1.55}
+.job a{font-weight:600;text-decoration:none;color:#4e8cff}.job a:hover{text-decoration:underline}
+.co{font-weight:700}.loc,.sal{opacity:.7;font-size:13px}
+</style></head><body>
+<h1>jobwatch board</h1>
+<div class="meta">__N__ matched jobs · last __DAYS__ days · updated __UPDATED__ · auto-refreshes every ~30 min</div>
+<input id="q" placeholder="search company, title, location…">
+<div class="tabs"><button data-c="" class="on">All</button><button data-c="intern">🛠️ Internships</button><button data-c="ft">💼 Full-time</button></div>
+<div id="list"></div>
+<script>
+const JOBS=__DATA__;
+let cat="",q="";
+const esc=s=>{const d=document.createElement("span");d.textContent=s;return d.innerHTML};
+function render(){
+ let h="",day="";
+ for(const j of JOBS){
+  const c=j.cat==="intern"?"intern":"ft";
+  if(cat&&c!==cat)continue;
+  if(q&&!(j.company+" "+j.title+" "+j.loc).toLowerCase().includes(q))continue;
+  if(j.ts!==day){day=j.ts;h+=`<div class="day">${day}</div>`}
+  const tag=j.cat==="intern"?"🛠️":j.cat==="new_grad"?"🎓":"💼";
+  h+=`<div class="job">${tag} <span class="co">${esc(j.company)}</span> — <a href="${esc(j.url)}" target="_blank" rel="noopener">${esc(j.title)}</a>${j.loc?` <span class="loc">· ${esc(j.loc)}</span>`:""}${j.sal?` <span class="sal">· 💰 ${esc(j.sal)}</span>`:""}</div>`
+ }
+ document.getElementById("list").innerHTML=h||"<p>no matches</p>";
+}
+document.getElementById("q").addEventListener("input",e=>{q=e.target.value.toLowerCase();render()});
+document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("on"));b.classList.add("on");cat=b.dataset.c;render()}));
+render();
+</script></body></html>
+"""
+
+
+def cmd_board(con):
+    """Render docs/jobs.html — one searchable page of everything the watcher
+    matched in the last RECENT_DAYS days (served via GitHub Pages)."""
+    rows = con.execute(
+        "SELECT ts, company, title, url, location, salary FROM recent "
+        "ORDER BY ts DESC, company").fetchall()
+    seen, jobs = set(), []
+    for ts, company, title, url, location, salary in rows:
+        if url in seen:
+            continue
+        seen.add(url)
+        jobs.append({"ts": ts[:10], "company": company, "title": title,
+                     "url": url, "loc": _short_loc(location or ""),
+                     "sal": salary or "", "cat": _category(title)})
+    data = json.dumps(jobs, separators=(",", ":")).replace("</", "<\\/")
+    doc = (BOARD_TMPL.replace("__DATA__", data)
+           .replace("__N__", str(len(jobs)))
+           .replace("__DAYS__", str(RECENT_DAYS))
+           .replace("__UPDATED__", now()))
+    out = HERE / "docs" / "jobs.html"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(doc)
+    print(f"wrote {out} ({len(jobs)} jobs)")
 
 
 # ================================================================ cli
@@ -1061,6 +1170,9 @@ def cmd_test(config, who):
         ("test", {"id": "t4", "company": "Jane Street",
                   "title": "Quantitative Trader — Summer Internship",
                   "location": "New York, NY", "url": "https://example.com/4"}),
+        ("test", {"id": "t5", "company": "SomeCo (not on watchlist)",
+                  "title": "Software Engineer Intern",
+                  "location": "Chicago, IL", "url": "https://example.com/5"}),
     ]
     con = db_open()
     print("sent ok" if deliver(sub, fake, con) else "send FAILED — check webhook/token")
@@ -1075,6 +1187,8 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--list", metavar="BOARD")
     ap.add_argument("--test", metavar="SUBSCRIBER")
+    ap.add_argument("--board", action="store_true",
+                    help="render docs/jobs.html from the recent-jobs table")
     args = ap.parse_args()
 
     config = json.loads(Path(args.config).read_text())
@@ -1086,6 +1200,13 @@ def main():
         return
     if args.test:
         cmd_test(config, args.test)
+        return
+    if args.board:
+        fresh = not DB_PATH.exists()
+        con = db_open()
+        if fresh and STATE_JSON.exists():
+            import_state(con)
+        cmd_board(con)
         return
     if args.list:
         _, jobs = fetch_board(args.list, config["boards"][args.list])
