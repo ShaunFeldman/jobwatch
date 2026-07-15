@@ -2,6 +2,7 @@
   "_readme": "Run `python watcher.py --verify` once — it hits every board and tells you which tokens are wrong. Fix a broken token by opening the company careers page and reading the URL: job-boards.greenhouse.io/TOKEN, jobs.lever.co/TOKEN, jobs.ashbyhq.com/TOKEN, jobs.smartrecruiters.com/TOKEN. Workday boards: devtools Network tab, find POST to /wday/cxs/TENANT/SITE/jobs (searchText barely filters on workday, so we fetch the 300 newest and let the regex filters do the work). Companies not listed here (Jane Street, Google, Meta, Apple, most banks) are covered by the github_listings/jobright aggregator sources and the linkedin guest-search boards at the bottom. min_interval works across GitHub Actions runs now (last_poll persists via state.json).",
 
   "interval_seconds": 45,
+  "feed_flush_minutes": 0,
   "digest_hour_utc": 13,
   "healthcheck_url": "",
 

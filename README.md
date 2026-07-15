@@ -42,29 +42,28 @@ company, staffing-agency spam filtered, no link-preview spam.
 - New boards seed silently — you're only alerted for jobs posted after the
   board was added.
 
-## Discord output — Discord IS the board
+## Discord output — simple on purpose
 
-Two tiers, four streams, each routable to its own channel (or all in one):
+One rule: **only jobs you'd actually apply to buzz you; everything else
+piles up quietly in tidy digests.**
 
-- **🎯 apply-now pings** (loud, `ping_webhook`): jobs at watchlist companies
-  that are intern/new-grad roles. One rich embed per job — clickable title,
-  📍 location, 💰 salary — with `discord_mention` support so it actually
-  buzzes your phone. Footer nudges the workflow: **react ✅ once you've
-  applied**, and the channel doubles as your application tracker.
-- **⭐ watchlist feed** (silent, `feeds.watchlist`): every other role at
-  watchlist companies.
-- **🛠️ internships / 💼 full-time feeds** (silent, `feeds.intern` /
-  `feeds.full_time`): everything else, split by role type.
+- **🎯 apply-now** (loud, instant, `ping_webhook`): internships (gold) and
+  new-grad roles (orange) at watchlist companies. One rich card per job —
+  clickable title, 📍 location, 💰 salary. Set `discord_mention` to
+  `"<@your-user-id>"` (or a role like `"<@&role-id>"` so the whole server
+  can opt in) to guarantee the buzz. React ✅ once you've applied — the
+  channel doubles as the application tracker.
+- **🛠️ internships feed** (silent, `feeds.intern`): every other internship,
+  posted as it appears — grouped by company, @silent so it never notifies.
+- **💼 full-time feed** (silent, `feeds.full_time`): everything else, same
+  deal; ⭐ marks watchlist companies. Set `feed_flush_minutes` > 0 to bundle
+  feed posts into digests every N minutes instead.
 
-Feed messages are plain text (not embeds) on purpose: Discord search only
-indexes message content, so `in:#internships stripe` filters the backlog
-instantly. Links are `<>`-masked — no preview spam — and carry the @silent
-flag, so feeds never notify.
-
-Recommended server layout: four channels (`#🎯apply-now`, `#⭐watchlist`,
+Recommended server layout: three channels (`#🎯apply-now`,
 `#🛠️internships`, `#💼full-time`), one webhook each, stored as the Actions
-secrets `DISCORD_WEBHOOK_APPLY / _WATCHLIST / _INTERN / _FULLTIME`. Any
-unset secret falls back to the main channel.
+secrets `DISCORD_WEBHOOK_APPLY / _INTERN / _FULLTIME`. Any unset secret
+falls back to the main `DISCORD_WEBHOOK_*` channel — it all works in a
+single channel too.
 
 Also: 📊 daily digest at `digest_hour_utc` (subscribers with `digest: true`)
 and ⚠️ ops alerts when a board fails 10 polls in a row (`ops: true`).

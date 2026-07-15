@@ -423,6 +423,9 @@ def db_open():
     con.execute("""CREATE TABLE IF NOT EXISTS recent(
         ts TEXT, company TEXT, title TEXT, url TEXT,
         location TEXT DEFAULT '', salary TEXT DEFAULT '')""")
+    con.execute("""CREATE TABLE IF NOT EXISTS pending(
+        sub TEXT, tier TEXT, ts TEXT, company TEXT, title TEXT, url TEXT,
+        location TEXT DEFAULT '', salary TEXT DEFAULT '')""")
     con.execute("""CREATE TABLE IF NOT EXISTS kv(
         k TEXT PRIMARY KEY, v TEXT)""")
     return con
@@ -453,6 +456,8 @@ def export_state(con):
     state["alerted"] = [r[0] for r in con.execute("SELECT key FROM alerted")]
     state["recent"] = [list(r) for r in con.execute(
         "SELECT ts, company, title, url, location, salary FROM recent")]
+    state["pending"] = [list(r) for r in con.execute(
+        "SELECT sub, tier, ts, company, title, url, location, salary FROM pending")]
     state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -475,6 +480,8 @@ def import_state(con):
     con.executemany("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     [tuple(r) + ("",) * (6 - len(r))
                      for r in state.get("recent", [])])
+    con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
+                    [tuple(r) for r in state.get("pending", [])])
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
     con.commit()
@@ -687,41 +694,67 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
     return ok
 
 
-def send_discord_feed(webhook, header, jobs):
-    """Feed messages use plain content (not embeds) because Discord's search
-    only indexes message content — this makes the feed a searchable board
-    (`in:#channel stripe`). Links are <>-masked so nothing unfurls, and the
-    @silent flag (4096) + suppress-embeds flag (4) keep it quiet."""
-    lines = []
+def _feed_blocks(jobs, watch=None):
+    """One block per company; ⭐ marks watchlist companies so they pop while
+    scrolling."""
+    blocks = []
     for company, js in _group(jobs):
+        star = "⭐ " if watch and watch.search(company) else ""
+        lines = [f"{star}**{company}**"]
         for j in js:
-            title = j["title"].replace("[", "(").replace("]", ")").replace("`", "'").strip()
+            title = j["title"].replace("[", "(").replace("]", ")").strip()
             if len(title) > 90:
                 title = title[:87] + "…"
             loc = _short_loc(j["location"])
             if len(loc) > 40:
                 loc = loc[:37] + "…"
-            sal = (j.get("salary") or "").strip()[:40]
-            line = f"{_tag(j['title'])} **{company}** — [{title}](<{j['url']}>)"
+            line = f"{_tag(j['title'])} [{title}]({j['url']})"
             if loc:
                 line += f" · {loc}"
+            sal = (j.get("salary") or "").strip()
             if sal:
-                line += f" · 💰 {sal}"
+                line += f" · 💰 {sal[:40]}"
             lines.append(line)
-    ok = True
-    chunk = f"**{header}**"
-    chunks = []
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 1900:
-            chunks.append(chunk)
-            chunk = line
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _pack(blocks, limit):
+    out, cur = [], ""
+    for b in blocks:
+        while len(b) > limit:           # a single huge company block
+            cut = b.rfind("\n", 0, limit)
+            if cut <= 0:
+                cut = limit
+            out.append(b[:cut])
+            b = b[cut:].lstrip("\n")
+        if cur and len(cur) + len(b) + 2 > limit:
+            out.append(cur)
+            cur = b
         else:
-            chunk += "\n" + line
-    chunks.append(chunk)
-    for c in chunks:
+            cur = f"{cur}\n\n{b}" if cur else b
+    if cur:
+        out.append(cur)
+    return out
+
+
+def send_discord_feed(webhook, label, jobs, color, watch=None):
+    """Silent digest embed(s): jobs grouped under bold company names, @silent
+    flag so the channel fills up quietly for browsing whenever."""
+    descs = _pack(_feed_blocks(jobs, watch), 3500)
+    ts = datetime.now(timezone.utc).isoformat()
+    n = len(jobs)
+    ok = True
+    for i, desc in enumerate(descs):
+        title = label.format(n=n, s="s" if n != 1 else "")
+        if len(descs) > 1:
+            title += f"  ·  {i + 1}/{len(descs)}"
+        payload = {"embeds": [{"title": title, "description": desc,
+                               "color": color, "timestamp": ts,
+                               "footer": {"text": "jobwatch · quiet digest"}}],
+                   "flags": 4096}
         ok &= _post_with_retry(
-            lambda p={"content": c, "flags": 4100}:
-                requests.post(webhook, json=p, timeout=10),
+            lambda p=payload: requests.post(webhook, json=p, timeout=10),
             "discord")
     return ok
 
@@ -777,14 +810,13 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
-    """Ping tier: jobs at watchlist companies that are intern/new-grad roles
-    (loud embed + optional mention). Everything else lands @silent as plain
-    searchable text — Discord IS the board: ⭐ other watchlist-company roles,
-    🛠️ internships, 💼 full-time. Per-tier webhooks route to separate
-    channels when configured; otherwise all use the main one."""
+    """Ping tier fires INSTANTLY: jobs at watchlist companies that are
+    intern/new-grad roles (rich card per job + optional mention). Everything
+    else queues in `pending` and flushes as one quiet digest every
+    feed_flush_minutes (see flush_feeds) — organized, not spammy."""
     watch = sub.get("watch")
-    tiers = {"ping_intern": [], "ping_grad": [], "feed_watch": [],
-             "feed_intern": [], "feed_ft": []}
+    tiers = {"ping_intern": [], "ping_grad": []}
+    ts = now()
     for b, j in jobs:
         cat = _category(j["title"])
         # watchlist matches company only — titles like 'Salesforce Developer
@@ -792,15 +824,14 @@ def deliver(sub, jobs, con):
         hot = bool(watch and watch.search(j.get("company") or b))
         if hot and cat != "other":
             tiers["ping_intern" if cat == "intern" else "ping_grad"].append((b, j))
-        elif hot:
-            tiers["feed_watch"].append((b, j))
-        elif cat == "intern":
-            tiers["feed_intern"].append((b, j))
         else:
-            tiers["feed_ft"].append((b, j))
+            con.execute(
+                "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
+                (sub["name"], "intern" if cat == "intern" else "ft", ts,
+                 j.get("company") or b.replace("_", " "), j["title"],
+                 j["url"], j.get("location") or "", j.get("salary") or ""))
 
-    main = sub["discord"]
-    ping_hook = sub["ping_hook"] or main
+    ping_hook = sub["ping_hook"] or sub["discord"]
     ok = True
     if tiers["ping_intern"] and ping_hook:
         ok &= send_discord_ping(ping_hook, tiers["ping_intern"],
@@ -808,27 +839,57 @@ def deliver(sub, jobs, con):
     if tiers["ping_grad"] and ping_hook:
         ok &= send_discord_ping(ping_hook, tiers["ping_grad"],
                                 "new grad role", mention=sub["mention"])
-    feed_defs = [("feed_watch", "watchlist", "⭐ watchlist — {n} other role{s}"),
-                 ("feed_intern", "intern", "🛠️ {n} internship{s}"),
-                 ("feed_ft", "full_time", "💼 {n} full-time role{s}")]
-    for tier, hook_name, header in feed_defs:
-        items = tiers[tier]
-        hook = sub["feeds"].get(hook_name) or main
-        if items and hook:
-            n = len(items)
-            ok &= send_discord_feed(
-                hook, header.format(n=n, s="s" if n != 1 else ""), items)
-    if sub["telegram_chat"]:
-        text = _telegram_text(jobs)
-        hot_cos = [j.get("company") or b
-                   for k in ("ping_intern", "ping_grad") for b, j in tiers[k]]
-        if hot_cos:
-            text = "🎯 apply now: " + ", ".join(hot_cos) + "\n\n" + text
-        ok &= send_telegram(sub["telegram_chat"], text)
+    hot_all = tiers["ping_intern"] + tiers["ping_grad"]
+    if sub["telegram_chat"] and hot_all:
+        ok &= send_telegram(sub["telegram_chat"],
+                            "🎯 apply now\n\n" + _telegram_text(hot_all))
     for b, j in jobs:
         con.execute("INSERT INTO sends VALUES (?,?,?,?,?)",
                     (now(), sub["name"], b, j["id"], int(ok)))
     return ok
+
+
+def flush_feeds(config, con, subs, force=False):
+    """Send queued feed jobs as one quiet digest per stream once the oldest
+    queued job is feed_flush_minutes old (or the queue is huge). Pings never
+    wait — this only paces the browse-later material."""
+    flush_min = config.get("feed_flush_minutes", 180)
+    for sub in subs:
+        rows = con.execute(
+            "SELECT tier, ts, company, title, url, location, salary "
+            "FROM pending WHERE sub=?", (sub["name"],)).fetchall()
+        if not rows:
+            continue
+        oldest = min(r[1] for r in rows)
+        age_min = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(oldest)).total_seconds() / 60
+        if not force and age_min < flush_min and len(rows) < 80:
+            continue
+        by_tier = {"intern": [], "ft": []}
+        for tier, ts, company, title, url, location, salary in rows:
+            by_tier.setdefault(tier, []).append(
+                ("", {"company": company, "title": title, "url": url,
+                      "location": location, "salary": salary}))
+        main = sub["discord"]
+        watch = sub.get("watch")
+        ok = True
+        if by_tier["intern"]:
+            hook = sub["feeds"].get("intern") or main
+            if hook:
+                ok &= send_discord_feed(hook, "🛠️ {n} new internship{s}",
+                                        by_tier["intern"], 0x5865F2, watch)
+        if by_tier["ft"]:
+            hook = sub["feeds"].get("full_time") or main
+            if hook:
+                ok &= send_discord_feed(hook,
+                                        "💼 {n} new-grad / full-time role{s}",
+                                        by_tier["ft"], 0x95A5A6, watch)
+        if sub["telegram_chat"]:
+            everything = by_tier["intern"] + by_tier["ft"]
+            ok &= send_telegram(sub["telegram_chat"], _telegram_text(everything))
+        if ok:
+            con.execute("DELETE FROM pending WHERE sub=?", (sub["name"],))
+            log(f"  -> {sub['name']}: flushed {len(rows)} queued feed job(s)")
 
 
 def maybe_digest(config, con, subs):
@@ -999,6 +1060,8 @@ def cycle(config, con):
                          j["title"], j["url"], j.get("location") or "",
                          j.get("salary") or ""))
 
+    flush_feeds(config, con, subs)
+
     if broke:
         detail = ", ".join(f"{n} ({err})" for n, err in broke)
         for sub in subs:
@@ -1017,6 +1080,7 @@ def cycle(config, con):
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
                 (f"-{RECENT_DAYS} days",))
+    con.execute("DELETE FROM pending WHERE ts < datetime('now', '-7 days')")
     con.commit()
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
@@ -1100,20 +1164,19 @@ def cmd_test(config, who):
     if sub["discord"]:
         send_discord_note(
             sub["discord"], "🧪 jobwatch test — every delivery scenario",
-            "The next messages demo each stream with fake jobs:\n\n"
-            "**1. 🎯 apply-now, internships** (gold cards, LOUD): watchlist "
-            "company + intern role → Stripe, Jane Street\n"
-            "**2. 🎯 apply-now, new grad** (orange card, LOUD): watchlist "
-            "company + new-grad role → Databricks\n"
-            "**3. ⭐ watchlist feed** (plain text, @silent): watchlist company "
-            "but not intern/grad-titled → Anthropic\n"
-            "**4. 🛠️ internship feed** (plain text, @silent): intern role at a "
-            "non-watchlist company → SomeCo\n"
-            "**5. 💼 full-time feed** (plain text, @silent): everything else → "
-            "RandomCorp\n\n"
-            "Only 1 and 2 ever notify. Feeds are searchable: try "
-            "`in:#this-channel stripe` in Discord's search bar. React ✅ on "
-            "apply-cards you've finished — that's your tracker.",
+            "How this works, in one line: **only jobs you'd actually apply "
+            "to buzz you; everything else piles up quietly in tidy digests.**"
+            "\n\nThe next messages demo it with fake jobs:\n\n"
+            "**1. 🎯 gold cards (LOUD, instant)** — internships at watchlist "
+            "companies → Stripe, Jane Street\n"
+            "**2. 🎯 orange card (LOUD, instant)** — new-grad roles at "
+            "watchlist companies → Databricks\n"
+            "**3. 🛠️ internships feed (@silent)** — every other internship, "
+            "sent as it appears but never notifies → SomeCo\n"
+            "**4. 💼 full-time feed (@silent)** — everything else, also "
+            "silent; ⭐ marks watchlist companies → Anthropic ⭐, RandomCorp\n"
+            "\nReact ✅ on a card once you've applied — the channel becomes "
+            "your tracker. That's the whole system.",
             0x9B59B6)
     fake = [
         ("test", {"id": "t1", "company": "Stripe",
@@ -1138,7 +1201,9 @@ def cmd_test(config, who):
                   "location": "Seattle, WA", "url": "https://example.com/6"}),
     ]
     con = db_open()
-    print("sent ok" if deliver(sub, fake, con) else "send FAILED — check webhook/token")
+    ok = deliver(sub, fake, con)
+    flush_feeds(config, con, [sub], force=True)   # demo digests immediately
+    print("sent ok" if ok else "send FAILED — check webhook/token")
     con.commit()
 
 
