@@ -1097,25 +1097,45 @@ def cmd_test(config, who):
     if not sub["discord"] and not sub["telegram_chat"]:
         sys.exit(f"'{who}' has no delivery channel — if the webhook is an "
                  f"env: secret, export it first")
+    if sub["discord"]:
+        send_discord_note(
+            sub["discord"], "🧪 jobwatch test — every delivery scenario",
+            "The next messages demo each stream with fake jobs:\n\n"
+            "**1. 🎯 apply-now, internships** (gold cards, LOUD): watchlist "
+            "company + intern role → Stripe, Jane Street\n"
+            "**2. 🎯 apply-now, new grad** (orange card, LOUD): watchlist "
+            "company + new-grad role → Databricks\n"
+            "**3. ⭐ watchlist feed** (plain text, @silent): watchlist company "
+            "but not intern/grad-titled → Anthropic\n"
+            "**4. 🛠️ internship feed** (plain text, @silent): intern role at a "
+            "non-watchlist company → SomeCo\n"
+            "**5. 💼 full-time feed** (plain text, @silent): everything else → "
+            "RandomCorp\n\n"
+            "Only 1 and 2 ever notify. Feeds are searchable: try "
+            "`in:#this-channel stripe` in Discord's search bar. React ✅ on "
+            "apply-cards you've finished — that's your tracker.",
+            0x9B59B6)
     fake = [
-        ("test", {"id": "t0", "company": "jobwatch",
-                  "title": "test message — delivery works, sample layout below",
-                  "location": "everywhere", "url": "https://example.com"}),
         ("test", {"id": "t1", "company": "Stripe",
                   "title": "Software Engineer, Intern (Summer 2026)",
-                  "location": "New York, NY", "url": "https://example.com/1"}),
-        ("test", {"id": "t2", "company": "Stripe",
-                  "title": "Software Engineer, New Grad",
-                  "location": "Toronto, ON", "url": "https://example.com/2"}),
-        ("test", {"id": "t3", "company": "Anthropic",
-                  "title": "Software Engineer, 2026 Start",
-                  "location": "Remote — US", "url": "https://example.com/3"}),
-        ("test", {"id": "t4", "company": "Jane Street",
+                  "location": "New York, NY", "salary": "$55 – $62/hr",
+                  "url": "https://example.com/1"}),
+        ("test", {"id": "t2", "company": "Jane Street",
                   "title": "Quantitative Trader — Summer Internship",
-                  "location": "New York, NY", "url": "https://example.com/4"}),
-        ("test", {"id": "t5", "company": "SomeCo (not on watchlist)",
+                  "location": "New York, NY", "url": "https://example.com/2"}),
+        ("test", {"id": "t3", "company": "Databricks",
+                  "title": "New Grad Software Engineer",
+                  "location": "Toronto, ON", "salary": "$140K – $180K",
+                  "url": "https://example.com/3"}),
+        ("test", {"id": "t4", "company": "Anthropic",
+                  "title": "Software Engineer, 2026 Start",
+                  "location": "Remote — US", "url": "https://example.com/4"}),
+        ("test", {"id": "t5", "company": "SomeCo",
                   "title": "Software Engineer Intern",
                   "location": "Chicago, IL", "url": "https://example.com/5"}),
+        ("test", {"id": "t6", "company": "RandomCorp",
+                  "title": "Machine Learning Engineer",
+                  "location": "Seattle, WA", "url": "https://example.com/6"}),
     ]
     con = db_open()
     print("sent ok" if deliver(sub, fake, con) else "send FAILED — check webhook/token")
