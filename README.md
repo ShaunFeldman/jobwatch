@@ -44,14 +44,15 @@ company, staffing-agency spam filtered, no link-preview spam.
 
 ## Discord output — simple on purpose
 
-One rule: **the feeds hold every job; the apply-now channels hold the ones
-worth applying to, and only those buzz you.**
+One rule: **the feeds hold every job; anything from a watchlist company
+also lands in an apply-now channel and buzzes you.**
 
 - **🎯 apply-now-intern** (loud, `ping_webhooks.intern`): internships at
   watchlist companies — one gold card per job (clickable title, 📍 location,
   💰 salary).
-- **🎯 apply-now-full-time** (loud, `ping_webhooks.full_time`): new-grad
-  roles at watchlist companies — orange cards.
+- **🎯 apply-now-full-time** (loud, `ping_webhooks.full_time`): every other
+  role at watchlist companies (new grad or otherwise — Citadel drops
+  anything, you hear about it) — orange cards.
 - **🛠️ internships feed** (silent, `feeds.intern`): EVERY internship,
   including the apply-now ones — the complete archive, grouped by company,
   ⭐ marks watchlist companies, @silent so it never notifies.

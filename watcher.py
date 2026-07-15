@@ -647,12 +647,18 @@ def _short_loc(loc):
 
 
 def _group(jobs):
-    """[(board, job)] -> [(company, [job])], companies A-Z, titles A-Z."""
+    """[(board, job)] -> [(company, [job])], companies A-Z, titles A-Z.
+    Groups case-insensitively — direct boards say 'stripe' while aggregators
+    say 'Stripe' — and displays the best-cased variant."""
     groups = {}
     for b, j in jobs:
-        groups.setdefault(j.get("company") or b.replace("_", " "), []).append(j)
-    return sorted(((c, sorted(js, key=lambda x: x["title"]))
-                   for c, js in groups.items()), key=lambda kv: kv[0].lower())
+        raw = (j.get("company") or b.replace("_", " ")).strip()
+        g = groups.setdefault(raw.casefold(), {"name": raw, "jobs": []})
+        if raw != raw.lower() and g["name"] == g["name"].lower():
+            g["name"] = raw            # prefer 'Stripe' over 'stripe'
+        g["jobs"].append(j)
+    return sorted(((g["name"], sorted(g["jobs"], key=lambda x: x["title"]))
+                   for g in groups.values()), key=lambda kv: kv[0].lower())
 
 
 def send_discord_ping(webhook, jobs, kind, mention=""):
@@ -696,12 +702,12 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
 
 
 def _feed_blocks(jobs, watch=None):
-    """One block per company; ⭐ marks watchlist companies so they pop while
-    scrolling."""
+    """[(header, [lines])] — one block per company; ⭐ marks watchlist
+    companies so they pop while scrolling."""
     blocks = []
     for company, js in _group(jobs):
         star = "⭐ " if watch and watch.search(company) else ""
-        lines = [f"{star}**{company}**"]
+        lines = []
         for j in js:
             title = j["title"].replace("[", "(").replace("]", ")").strip()
             if len(title) > 90:
@@ -716,27 +722,33 @@ def _feed_blocks(jobs, watch=None):
             if sal:
                 line += f" · 💰 {sal[:40]}"
             lines.append(line)
-        blocks.append("\n".join(lines))
+        blocks.append((f"{star}**{company}**", lines))
     return blocks
 
 
 def _pack(blocks, limit):
-    out, cur = [], ""
-    for b in blocks:
-        while len(b) > limit:           # a single huge company block
-            cut = b.rfind("\n", 0, limit)
-            if cut <= 0:
-                cut = limit
-            out.append(b[:cut])
-            b = b[cut:].lstrip("\n")
-        if cur and len(cur) + len(b) + 2 > limit:
-            out.append(cur)
-            cur = b
-        else:
-            cur = f"{cur}\n\n{b}" if cur else b
+    """Pack (header, lines) blocks into strings ≤ limit chars. A company
+    split across chunks repeats its header with '(cont.)' so no job ever
+    floats under the wrong company."""
+    descs, cur = [], ""
+    for header, lines in blocks:
+        block = "\n".join([header] + lines)
+        if len(block) <= limit - (len(cur) + 2 if cur else 0):
+            cur = f"{cur}\n\n{block}" if cur else block
+            continue
+        if cur:
+            descs.append(cur)
+            cur = ""
+        buf = header
+        for line in lines:
+            if len(buf) + len(line) + 1 > limit:
+                descs.append(buf)
+                buf = f"{header} *(cont.)*"
+            buf += "\n" + line
+        cur = buf
     if cur:
-        out.append(cur)
-    return out
+        descs.append(cur)
+    return descs
 
 
 def send_discord_feed(webhook, label, jobs, color, watch=None):
@@ -813,19 +825,18 @@ def _telegram_text(jobs):
 def deliver(sub, jobs, con):
     """The feeds (🛠️ intern / 💼 full-time) receive EVERY matching job — they
     are the complete archive, queued in `pending` and posted @silent.
-    Jobs at watchlist companies that are intern/new-grad roles ALSO fire an
-    instant loud ping (rich card per job + optional mention) to the matching
-    apply-now channel — those are the ones worth applying to."""
+    ANY job at a watchlist company ALSO fires an instant loud ping (rich card
+    per job + optional mention): internships to the apply-now-intern channel,
+    everything else to apply-now-full-time. Citadel drops anything → ping."""
     watch = sub.get("watch")
-    tiers = {"ping_intern": [], "ping_grad": []}
+    tiers = {"ping_intern": [], "ping_ft": []}
     ts = now()
     for b, j in jobs:
         cat = _category(j["title"])
         # watchlist matches company only — titles like 'Salesforce Developer
         # Intern' at a consultancy must not count
-        hot = bool(watch and watch.search(j.get("company") or b))
-        if hot and cat != "other":
-            tiers["ping_intern" if cat == "intern" else "ping_grad"].append((b, j))
+        if watch and watch.search(j.get("company") or b):
+            tiers["ping_intern" if cat == "intern" else "ping_ft"].append((b, j))
         con.execute(
             "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
             (sub["name"], "intern" if cat == "intern" else "ft", ts,
@@ -839,12 +850,12 @@ def deliver(sub, jobs, con):
         if hook:
             ok &= send_discord_ping(hook, tiers["ping_intern"],
                                     "internship", mention=sub["mention"])
-    if tiers["ping_grad"]:
+    if tiers["ping_ft"]:
         hook = sub["ping_hooks"].get("full_time") or main
         if hook:
-            ok &= send_discord_ping(hook, tiers["ping_grad"],
-                                    "new grad role", mention=sub["mention"])
-    hot_all = tiers["ping_intern"] + tiers["ping_grad"]
+            ok &= send_discord_ping(hook, tiers["ping_ft"],
+                                    "role", mention=sub["mention"])
+    hot_all = tiers["ping_intern"] + tiers["ping_ft"]
     if sub["telegram_chat"] and hot_all:
         ok &= send_telegram(sub["telegram_chat"],
                             "🎯 apply now\n\n" + _telegram_text(hot_all))
@@ -871,7 +882,12 @@ def flush_feeds(config, con, subs, force=False):
         if not force and age_min < flush_min and len(rows) < 80:
             continue
         by_tier = {"intern": [], "ft": []}
+        seen = set()
         for tier, ts, company, title, url, location, salary in rows:
+            key = (canon_url(url), company.casefold(), title.casefold())
+            if key in seen:     # same job queued twice via near-identical rows
+                continue
+            seen.add(key)
             by_tier.setdefault(tier, []).append(
                 ("", {"company": company, "title": title, "url": url,
                       "location": location, "salary": salary}))
@@ -1169,18 +1185,19 @@ def cmd_test(config, who):
     if sub["discord"]:
         send_discord_note(
             sub["discord"], "🧪 jobwatch test — every delivery scenario",
-            "How this works, in one line: **only jobs you'd actually apply "
-            "to buzz you; everything else piles up quietly in tidy digests.**"
+            "How this works, in one line: **anything from a watchlist "
+            "company buzzes you; everything lands quietly in the feeds.**"
             "\n\nThe next messages demo it with fake jobs:\n\n"
             "**1. 🎯 apply-now intern (LOUD, gold cards)** — internships at "
             "watchlist companies → Stripe, Jane Street\n"
-            "**2. 🎯 apply-now full-time (LOUD, orange card)** — new-grad "
-            "roles at watchlist companies → Databricks\n"
+            "**2. 🎯 apply-now full-time (LOUD, orange cards)** — ANY other "
+            "role at a watchlist company → Databricks (new grad), "
+            "Anthropic (2026 start)\n"
             "**3. 🛠️ internships feed (@silent)** — EVERY internship incl. "
             "the apply-now ones (⭐ = watchlist company) → ⭐ Stripe, "
             "⭐ Jane Street, SomeCo\n"
-            "**4. 💼 full-time feed (@silent)** — every full-time/new-grad "
-            "role, same idea → ⭐ Databricks, ⭐ Anthropic, RandomCorp\n"
+            "**4. 💼 full-time feed (@silent)** — every other role, same "
+            "idea → ⭐ Databricks, ⭐ Anthropic, RandomCorp\n"
             "\nThat's the whole system.",
             0x9B59B6)
     fake = [
