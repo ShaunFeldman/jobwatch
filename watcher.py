@@ -590,7 +590,8 @@ def load_subscribers(global_filters):
             "ops": bool(s.get("ops")),
             "digest": bool(s.get("digest")),
             "discord": _resolve_secret(s.get("discord_webhook", "")),
-            "ping_hook": _resolve_secret(s.get("ping_webhook", ""), quiet=True),
+            "ping_hooks": {k: _resolve_secret(v, quiet=True)
+                           for k, v in (s.get("ping_webhooks") or {}).items()},
             "feeds": {k: _resolve_secret(v, quiet=True)
                       for k, v in (s.get("feeds") or {}).items()},
             "telegram_chat": str(s.get("telegram_chat_id", "") or ""),
@@ -681,7 +682,7 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
             "description": "\n".join(parts),
             "color": color,
             "timestamp": ts,
-            "footer": {"text": "jobwatch · react ✅ once you've applied"},
+            "footer": {"text": "jobwatch"},
         })
     ok = True
     for i in range(0, len(embeds), 10):     # 10 embeds max per message
@@ -810,10 +811,11 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
-    """Ping tier fires INSTANTLY: jobs at watchlist companies that are
-    intern/new-grad roles (rich card per job + optional mention). Everything
-    else queues in `pending` and flushes as one quiet digest every
-    feed_flush_minutes (see flush_feeds) — organized, not spammy."""
+    """The feeds (🛠️ intern / 💼 full-time) receive EVERY matching job — they
+    are the complete archive, queued in `pending` and posted @silent.
+    Jobs at watchlist companies that are intern/new-grad roles ALSO fire an
+    instant loud ping (rich card per job + optional mention) to the matching
+    apply-now channel — those are the ones worth applying to."""
     watch = sub.get("watch")
     tiers = {"ping_intern": [], "ping_grad": []}
     ts = now()
@@ -824,21 +826,24 @@ def deliver(sub, jobs, con):
         hot = bool(watch and watch.search(j.get("company") or b))
         if hot and cat != "other":
             tiers["ping_intern" if cat == "intern" else "ping_grad"].append((b, j))
-        else:
-            con.execute(
-                "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
-                (sub["name"], "intern" if cat == "intern" else "ft", ts,
-                 j.get("company") or b.replace("_", " "), j["title"],
-                 j["url"], j.get("location") or "", j.get("salary") or ""))
+        con.execute(
+            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
+            (sub["name"], "intern" if cat == "intern" else "ft", ts,
+             j.get("company") or b.replace("_", " "), j["title"],
+             j["url"], j.get("location") or "", j.get("salary") or ""))
 
-    ping_hook = sub["ping_hook"] or sub["discord"]
+    main = sub["discord"]
     ok = True
-    if tiers["ping_intern"] and ping_hook:
-        ok &= send_discord_ping(ping_hook, tiers["ping_intern"],
-                                "internship", mention=sub["mention"])
-    if tiers["ping_grad"] and ping_hook:
-        ok &= send_discord_ping(ping_hook, tiers["ping_grad"],
-                                "new grad role", mention=sub["mention"])
+    if tiers["ping_intern"]:
+        hook = sub["ping_hooks"].get("intern") or main
+        if hook:
+            ok &= send_discord_ping(hook, tiers["ping_intern"],
+                                    "internship", mention=sub["mention"])
+    if tiers["ping_grad"]:
+        hook = sub["ping_hooks"].get("full_time") or main
+        if hook:
+            ok &= send_discord_ping(hook, tiers["ping_grad"],
+                                    "new grad role", mention=sub["mention"])
     hot_all = tiers["ping_intern"] + tiers["ping_grad"]
     if sub["telegram_chat"] and hot_all:
         ok &= send_telegram(sub["telegram_chat"],
@@ -1167,16 +1172,16 @@ def cmd_test(config, who):
             "How this works, in one line: **only jobs you'd actually apply "
             "to buzz you; everything else piles up quietly in tidy digests.**"
             "\n\nThe next messages demo it with fake jobs:\n\n"
-            "**1. 🎯 gold cards (LOUD, instant)** — internships at watchlist "
-            "companies → Stripe, Jane Street\n"
-            "**2. 🎯 orange card (LOUD, instant)** — new-grad roles at "
-            "watchlist companies → Databricks\n"
-            "**3. 🛠️ internships feed (@silent)** — every other internship, "
-            "sent as it appears but never notifies → SomeCo\n"
-            "**4. 💼 full-time feed (@silent)** — everything else, also "
-            "silent; ⭐ marks watchlist companies → Anthropic ⭐, RandomCorp\n"
-            "\nReact ✅ on a card once you've applied — the channel becomes "
-            "your tracker. That's the whole system.",
+            "**1. 🎯 apply-now intern (LOUD, gold cards)** — internships at "
+            "watchlist companies → Stripe, Jane Street\n"
+            "**2. 🎯 apply-now full-time (LOUD, orange card)** — new-grad "
+            "roles at watchlist companies → Databricks\n"
+            "**3. 🛠️ internships feed (@silent)** — EVERY internship incl. "
+            "the apply-now ones (⭐ = watchlist company) → ⭐ Stripe, "
+            "⭐ Jane Street, SomeCo\n"
+            "**4. 💼 full-time feed (@silent)** — every full-time/new-grad "
+            "role, same idea → ⭐ Databricks, ⭐ Anthropic, RandomCorp\n"
+            "\nThat's the whole system.",
             0x9B59B6)
     fake = [
         ("test", {"id": "t1", "company": "Stripe",

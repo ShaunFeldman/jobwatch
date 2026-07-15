@@ -44,26 +44,29 @@ company, staffing-agency spam filtered, no link-preview spam.
 
 ## Discord output — simple on purpose
 
-One rule: **only jobs you'd actually apply to buzz you; everything else
-piles up quietly in tidy digests.**
+One rule: **the feeds hold every job; the apply-now channels hold the ones
+worth applying to, and only those buzz you.**
 
-- **🎯 apply-now** (loud, instant, `ping_webhook`): internships (gold) and
-  new-grad roles (orange) at watchlist companies. One rich card per job —
-  clickable title, 📍 location, 💰 salary. Set `discord_mention` to
-  `"<@your-user-id>"` (or a role like `"<@&role-id>"` so the whole server
-  can opt in) to guarantee the buzz. React ✅ once you've applied — the
-  channel doubles as the application tracker.
-- **🛠️ internships feed** (silent, `feeds.intern`): every other internship,
-  posted as it appears — grouped by company, @silent so it never notifies.
-- **💼 full-time feed** (silent, `feeds.full_time`): everything else, same
-  deal; ⭐ marks watchlist companies. Set `feed_flush_minutes` > 0 to bundle
-  feed posts into digests every N minutes instead.
+- **🎯 apply-now-intern** (loud, `ping_webhooks.intern`): internships at
+  watchlist companies — one gold card per job (clickable title, 📍 location,
+  💰 salary).
+- **🎯 apply-now-full-time** (loud, `ping_webhooks.full_time`): new-grad
+  roles at watchlist companies — orange cards.
+- **🛠️ internships feed** (silent, `feeds.intern`): EVERY internship,
+  including the apply-now ones — the complete archive, grouped by company,
+  ⭐ marks watchlist companies, @silent so it never notifies.
+- **💼 full-time feed** (silent, `feeds.full_time`): every full-time /
+  new-grad role, same idea.
 
-Recommended server layout: three channels (`#🎯apply-now`,
-`#🛠️internships`, `#💼full-time`), one webhook each, stored as the Actions
-secrets `DISCORD_WEBHOOK_APPLY / _INTERN / _FULLTIME`. Any unset secret
-falls back to the main `DISCORD_WEBHOOK_*` channel — it all works in a
-single channel too.
+Set `discord_mention` to `"<@your-user-id>"` (or a role `"<@&role-id>"` so
+the whole server can opt in) to guarantee apply-now pings buzz phones.
+`feed_flush_minutes` > 0 bundles feed posts into digests every N minutes.
+
+Recommended server layout: four channels (`#🎯apply-now-intern`,
+`#🎯apply-now-fulltime`, `#🛠️internships`, `#💼full-time`), one webhook
+each, stored as the Actions secrets `DISCORD_WEBHOOK_APPLY_INTERN /
+_APPLY_FULLTIME / _INTERN / _FULLTIME`. Any unset secret falls back to the
+main `DISCORD_WEBHOOK_*` channel — it all works in a single channel too.
 
 Also: 📊 daily digest at `digest_hour_utc` (subscribers with `digest: true`)
 and ⚠️ ops alerts when a board fails 10 polls in a row (`ops: true`).
