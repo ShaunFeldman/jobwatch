@@ -734,10 +734,23 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
     pings are also findable via Discord search."""
     color = 0xF1C40F if kind == "internship" else 0xE67E22
     ts = datetime.now(timezone.utc).isoformat()
-    n = len(jobs)
-    header = f"🎯 **{n} watchlist {kind}{'s' if n != 1 else ''} just dropped**"
+    # content is what phone push previews show — plain text (markdown would
+    # render as literal ** in the notification), one compact line per job so
+    # you know company/role/location without opening Discord
+    lines = []
+    for b, j in jobs:
+        company = j.get("company") or b.replace("_", " ")
+        line = f"🎯 {company} — {j['title']}"
+        loc = _short_loc(j["location"])
+        if loc:
+            line += f" · {loc}"
+        lines.append(line[:150])
+    shown = lines[:5]
+    if len(lines) > 5:
+        shown.append(f"…and {len(lines) - 5} more")
+    header = "\n".join(shown)
     if mention:
-        header = f"{mention} {header}"
+        header = f"{mention}\n{header}"
     embeds = []
     for b, j in jobs:
         company = j.get("company") or b.replace("_", " ")
