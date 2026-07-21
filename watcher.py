@@ -60,6 +60,55 @@ def log(msg):
     print(f"{now()} {msg}", flush=True)
 
 
+# ---- posting freshness: adapters set job["posted"] = epoch seconds ----
+def _iso_epoch(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _workday_posted_epoch(text):
+    """'Posted Today' / 'Posted Yesterday' / 'Posted 5 Days Ago' -> epoch."""
+    if not text:
+        return None
+    t = text.lower()
+    if "today" in t:
+        return time.time()
+    if "yesterday" in t:
+        return time.time() - 86400
+    m = re.search(r"(\d+)\+?\s*day", t)
+    if m:
+        return time.time() - int(m.group(1)) * 86400
+    m = re.search(r"(\d+)\+?\s*month", t)
+    if m:
+        return time.time() - int(m.group(1)) * 30 * 86400
+    return None
+
+
+def _rel_age(posted):
+    """Compact freshness badge; 🔥 for <24h, plain for up to 21d, else ''."""
+    if not posted:
+        return ""
+    try:
+        age = time.time() - float(posted)
+    except (TypeError, ValueError):
+        return ""
+    if age < 0:
+        return ""
+    hours = age / 3600
+    if hours < 2:
+        return "🔥 just posted"
+    if hours < 24:
+        return f"🔥 {int(hours)}h ago"
+    days = int(hours // 24)
+    if days <= 21:
+        return f"{days}d ago"
+    return ""
+
+
 # ================================================================ adapters
 # Each returns list of {id, title, location, url, company}. id stable per board.
 
@@ -72,6 +121,7 @@ def fetch_greenhouse(cfg):
         "title": j.get("title", ""),
         "location": (j.get("location") or {}).get("name", ""),
         "url": j.get("absolute_url", ""),
+        "posted": _iso_epoch(j.get("first_published") or j.get("updated_at")),
     } for j in r.json().get("jobs", [])]
 
 
@@ -84,6 +134,7 @@ def fetch_lever(cfg):
         "title": j.get("text", ""),
         "location": (j.get("categories") or {}).get("location", "") or "",
         "url": j.get("hostedUrl", ""),
+        "posted": (j.get("createdAt") or 0) / 1000 or None,
     } for j in r.json()]
 
 
@@ -97,6 +148,7 @@ def fetch_ashby(cfg):
         "location": j.get("location", "") or "",
         "url": j.get("jobUrl", ""),
         "salary": (j.get("compensation") or {}).get("compensationTierSummary", ""),
+        "posted": _iso_epoch(j.get("publishedAt")),
     } for j in r.json().get("jobs", [])]
 
 
@@ -139,6 +191,7 @@ def fetch_workday(cfg):
                 "title": j.get("title", ""),
                 "location": j.get("locationsText", "") or "",
                 "url": f"https://{host}/en-US/{site}{path}",
+                "posted": _workday_posted_epoch(j.get("postedOn", "")),
             })
         offset += 20
         if not posts or offset >= total or offset >= 300:
@@ -216,6 +269,7 @@ def fetch_github_listings(cfg):
             "location": " | ".join(locs[:3]),
             "url": j.get("url", ""),
             "company": j.get("company_name", ""),
+            "posted": j.get("date_posted") or j.get("date_updated") or None,
         })
     return out
 
@@ -349,12 +403,14 @@ def _linkedin_query(cfg, q, location, out, seen):
             seen.add(jid)
             mc = re.search(r"base-search-card__subtitle[^>]*>\s*<a[^>]*>\s*([^<]+)", card)
             ml = re.search(r"job-search-card__location[^>]*>\s*([^<]+)", card)
+            md = re.search(r'datetime="([^"]+)"', card)
             out.append({
                 "id": jid,
                 "title": html.unescape(mt.group(1)).strip(),
                 "location": html.unescape(ml.group(1)).strip() if ml else "",
                 "url": f"https://www.linkedin.com/jobs/view/{jid}",
                 "company": html.unescape(mc.group(1)).strip() if mc else "",
+                "posted": _iso_epoch(md.group(1)) if md else None,
             })
         if not got:
             break
@@ -491,7 +547,7 @@ def db_open():
         location TEXT DEFAULT '', salary TEXT DEFAULT '')""")
     con.execute("""CREATE TABLE IF NOT EXISTS pending(
         sub TEXT, tier TEXT, ts TEXT, company TEXT, title TEXT, url TEXT,
-        location TEXT DEFAULT '', salary TEXT DEFAULT '')""")
+        location TEXT DEFAULT '', salary TEXT DEFAULT '', posted REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS kv(
         k TEXT PRIMARY KEY, v TEXT)""")
     return con
@@ -523,7 +579,8 @@ def export_state(con):
     state["recent"] = [list(r) for r in con.execute(
         "SELECT ts, company, title, url, location, salary FROM recent")]
     state["pending"] = [list(r) for r in con.execute(
-        "SELECT sub, tier, ts, company, title, url, location, salary FROM pending")]
+        "SELECT sub, tier, ts, company, title, url, location, salary, posted "
+        "FROM pending")]
     state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -546,8 +603,9 @@ def import_state(con):
     con.executemany("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     [tuple(r) + ("",) * (6 - len(r))
                      for r in state.get("recent", [])])
-    con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
-                    [tuple(r) for r in state.get("pending", [])])
+    con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
+                    [tuple(r) + (None,) * (9 - len(r))
+                     for r in state.get("pending", [])])
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
     con.commit()
@@ -744,7 +802,10 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
         loc = _short_loc(j["location"])
         if loc:
             line += f" · {loc}"
-        lines.append(line[:150])
+        age = _rel_age(j.get("posted"))
+        if age:
+            line += f" · {age}"
+        lines.append(line[:170])
     shown = lines[:5]
     if len(lines) > 5:
         shown.append(f"…and {len(lines) - 5} more")
@@ -758,6 +819,9 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
         loc = _short_loc(j["location"])
         if loc:
             parts.append(f"📍 {loc}")
+        age = _rel_age(j.get("posted"))
+        if age:
+            parts.append(f"🕒 {age}")
         sal = (j.get("salary") or "").strip()
         if sal:
             parts.append(f"💰 {sal[:60]}")
@@ -797,6 +861,9 @@ def _feed_blocks(jobs, watch=None):
             line = f"{_tag(j['title'])} [{title}]({j['url']})"
             if loc:
                 line += f" · {loc}"
+            age = _rel_age(j.get("posted"))
+            if age:
+                line += f" · {age}"
             sal = (j.get("salary") or "").strip()
             if sal:
                 line += f" · 💰 {sal[:40]}"
@@ -917,10 +984,11 @@ def deliver(sub, jobs, con):
         if watch and watch.search(j.get("company") or b):
             tiers["ping_intern" if cat == "intern" else "ping_ft"].append((b, j))
         con.execute(
-            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
             (sub["name"], "intern" if cat == "intern" else "ft", ts,
              j.get("company") or b.replace("_", " "), j["title"],
-             j["url"], j.get("location") or "", j.get("salary") or ""))
+             j["url"], j.get("location") or "", j.get("salary") or "",
+             j.get("posted")))
 
     main = sub["discord"]
     ok = True
@@ -951,7 +1019,7 @@ def flush_feeds(config, con, subs, force=False):
     flush_min = config.get("feed_flush_minutes", 180)
     for sub in subs:
         rows = con.execute(
-            "SELECT tier, ts, company, title, url, location, salary "
+            "SELECT tier, ts, company, title, url, location, salary, posted "
             "FROM pending WHERE sub=?", (sub["name"],)).fetchall()
         if not rows:
             continue
@@ -962,14 +1030,14 @@ def flush_feeds(config, con, subs, force=False):
             continue
         by_tier = {"intern": [], "ft": []}
         seen = set()
-        for tier, ts, company, title, url, location, salary in rows:
+        for tier, ts, company, title, url, location, salary, posted in rows:
             key = (canon_url(url), company.casefold(), title.casefold())
             if key in seen:     # same job queued twice via near-identical rows
                 continue
             seen.add(key)
             by_tier.setdefault(tier, []).append(
                 ("", {"company": company, "title": title, "url": url,
-                      "location": location, "salary": salary}))
+                      "location": location, "salary": salary, "posted": posted}))
         main = sub["discord"]
         watch = sub.get("watch")
         ok = True
@@ -1279,24 +1347,27 @@ def cmd_test(config, who):
             "idea → ⭐ Databricks, ⭐ Anthropic, RandomCorp\n"
             "\nThat's the whole system.",
             0x9B59B6)
+    nowt = time.time()
     fake = [
         ("test", {"id": "t1", "company": "Stripe",
                   "title": "Software Engineer, Intern (Summer 2026)",
                   "location": "New York, NY", "salary": "$55 – $62/hr",
-                  "url": "https://example.com/1"}),
+                  "posted": nowt - 3600, "url": "https://example.com/1"}),
         ("test", {"id": "t2", "company": "Jane Street",
                   "title": "Quantitative Trader — Summer Internship",
-                  "location": "New York, NY", "url": "https://example.com/2"}),
+                  "location": "New York, NY", "posted": nowt - 5 * 3600,
+                  "url": "https://example.com/2"}),
         ("test", {"id": "t3", "company": "Databricks",
                   "title": "New Grad Software Engineer",
                   "location": "Toronto, ON", "salary": "$140K – $180K",
-                  "url": "https://example.com/3"}),
+                  "posted": nowt - 2 * 86400, "url": "https://example.com/3"}),
         ("test", {"id": "t4", "company": "Anthropic",
                   "title": "Software Engineer, 2026 Start",
                   "location": "Remote — US", "url": "https://example.com/4"}),
         ("test", {"id": "t5", "company": "SomeCo",
                   "title": "Software Engineer Intern",
-                  "location": "Chicago, IL", "url": "https://example.com/5"}),
+                  "location": "Chicago, IL", "posted": nowt - 30 * 60,
+                  "url": "https://example.com/5"}),
         ("test", {"id": "t6", "company": "RandomCorp",
                   "title": "Machine Learning Engineer",
                   "location": "Seattle, WA", "url": "https://example.com/6"}),
