@@ -18,7 +18,6 @@ jobs:
       - run: pip install -r requirements.txt
       - name: send scenario demo to all channels
         env:
-          DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
           DISCORD_WEBHOOK_APPLY_INTERN: ${{ secrets.DISCORD_WEBHOOK_APPLY_INTERN }}
           DISCORD_WEBHOOK_APPLY_FULLTIME: ${{ secrets.DISCORD_WEBHOOK_APPLY_FULLTIME }}
           DISCORD_WEBHOOK_INTERN: ${{ secrets.DISCORD_WEBHOOK_INTERN }}

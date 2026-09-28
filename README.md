@@ -10,7 +10,8 @@ company, staffing-agency spam filtered, no link-preview spam.
 > ~4 minutes and pushing state after each cycle. The repo is public (Actions
 > minutes are free/unlimited), the concurrency group queues runs back-to-back,
 > and scheduler gaps under ~25 min cost nothing. Webhook URLs live only in
-> Actions secrets (`DISCORD_WEBHOOK_SHAUN`), never in the repo.
+> Actions secrets (`DISCORD_WEBHOOK_FULLTIME` and the optional per-feed
+> webhooks), never in the repo.
 >
 > Optional extra teeth: have an external cron (e.g. cron-job.org + a
 > fine-grained PAT with *Actions: write*) POST every 10 min to
@@ -97,3 +98,8 @@ python watcher.py                 # loop forever (VPS mode)
 
 Secrets (repo → Settings → Secrets → Actions): `TELEGRAM_BOT_TOKEN` (only for
 Telegram delivery), `HEALTHCHECK_URL` (optional dead-man ping).
+
+The required Discord fallback is `DISCORD_WEBHOOK_FULLTIME`. Add the optional
+`DISCORD_WEBHOOK_APPLY_INTERN`, `DISCORD_WEBHOOK_APPLY_FULLTIME`,
+and `DISCORD_WEBHOOK_INTERN` secrets to split the streams into separate
+channels; unset optional hooks use the full-time fallback.
