@@ -45,15 +45,17 @@ company, staffing-agency spam filtered, no link-preview spam.
 
 ## Discord output — simple on purpose
 
-One rule: **the feeds hold every job; anything from a watchlist company
-also lands in an apply-now channel and buzzes you.**
+One rule: **the feeds hold every matching job; only high-signal categories
+from watchlist companies buzz you.** Loud alerts are ranked and capped per
+cycle, while overflow still lands in the quiet feeds, so coverage stays broad
+without turning Discord into a firehose.
 
 - **🎯 apply-now-intern** (loud, `ping_webhooks.intern`): internships at
   watchlist companies — one gold card per job (clickable title, 📍 location,
   💰 salary).
-- **🎯 apply-now-full-time** (loud, `ping_webhooks.full_time`): every other
-  role at watchlist companies (new grad or otherwise — Citadel drops
-  anything, you hear about it) — orange cards.
+- **🎯 apply-now-full-time** (loud, `ping_webhooks.full_time`): new-grad
+  roles at watchlist companies — orange cards. Add `"other"` to a subscriber's
+  `ping_categories` if experienced/untagged roles should buzz too.
 - **🛠️ internships feed** (silent, `feeds.intern`): EVERY internship,
   including the apply-now ones — the complete archive, grouped by company,
   ⭐ marks watchlist companies, @silent so it never notifies.
@@ -63,6 +65,9 @@ also lands in an apply-now channel and buzzes you.**
 Set `discord_mention` to `"<@your-user-id>"` (or a role `"<@&role-id>"` so
 the whole server can opt in) to guarantee apply-now pings buzz phones.
 `feed_flush_minutes` > 0 bundles feed posts into digests every N minutes.
+`max_ping_jobs` caps loud cards per poll (the default is 10); `ping_categories`
+chooses from `intern`, `new_grad`, and `other`. Internships and new-grad roles
+rank ahead of untagged roles, then newer postings rank first.
 
 Recommended server layout: four channels (`#🎯apply-now-intern`,
 `#🎯apply-now-fulltime`, `#🛠️internships`, `#💼full-time`), one webhook

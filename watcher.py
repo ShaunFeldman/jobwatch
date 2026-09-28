@@ -70,6 +70,16 @@ def _iso_epoch(s):
         return None
 
 
+def _posted_epoch(value):
+    """Normalize adapter timestamps, which may be epoch numbers or ISO text."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return _iso_epoch(value)
+
+
 def _workday_posted_epoch(text):
     """'Posted Today' / 'Posted Yesterday' / 'Posted 5 Days Ago' -> epoch."""
     if not text:
@@ -92,10 +102,10 @@ def _rel_age(posted):
     """Compact freshness badge; 🔥 for <24h, plain for up to 21d, else ''."""
     if not posted:
         return ""
-    try:
-        age = time.time() - float(posted)
-    except (TypeError, ValueError):
+    epoch = _posted_epoch(posted)
+    if epoch is None:
         return ""
+    age = time.time() - epoch
     if age < 0:
         return ""
     hours = age / 3600
@@ -730,6 +740,9 @@ def load_subscribers(global_filters):
             "filt": Filt(s.get("filters", {}), fallback=global_filters),
             "watch": Filt._c(s.get("watchlist", "")),
             "mention": s.get("discord_mention", ""),
+            "ping_categories": set(s.get(
+                "ping_categories", ["intern", "new_grad", "other"])),
+            "max_ping_jobs": max(0, int(s.get("max_ping_jobs", 10))),
             "ops": bool(s.get("ops")),
             "digest": bool(s.get("digest")),
             "discord": _resolve_secret(s.get("discord_webhook", "")),
@@ -804,7 +817,7 @@ def _group(jobs):
                    for g in groups.values()), key=lambda kv: kv[0].lower())
 
 
-def send_discord_ping(webhook, jobs, kind, mention=""):
+def send_discord_ping(webhook, jobs, kind, mention="", omitted=0):
     """The apply-now tier: one rich embed PER JOB (clickable title, location,
     salary) so each ping is a self-contained application card. kind is
     'internship' or 'new grad role'. The header line is plain content, so
@@ -828,6 +841,9 @@ def send_discord_ping(webhook, jobs, kind, mention=""):
     shown = lines[:5]
     if len(lines) > 5:
         shown.append(f"…and {len(lines) - 5} more")
+    if omitted:
+        shown.append(f"📥 {omitted} lower-priority match{'es' if omitted != 1 else ''} "
+                     "saved to the quiet feeds")
     header = "\n".join(shown)
     if mention:
         header = f"{mention}\n{header}"
@@ -990,18 +1006,19 @@ def _telegram_text(jobs):
 def deliver(sub, jobs, con):
     """The feeds (🛠️ intern / 💼 full-time) receive EVERY matching job — they
     are the complete archive, queued in `pending` and posted @silent.
-    ANY job at a watchlist company ALSO fires an instant loud ping (rich card
-    per job + optional mention): internships to the apply-now-intern channel,
-    everything else to apply-now-full-time. Citadel drops anything → ping."""
+    Configured categories at watchlist companies also fire a ranked, capped
+    loud ping (rich card per job + optional mention). Overflow remains in the
+    feeds, preserving coverage without creating a notification firehose."""
     watch = sub.get("watch")
-    tiers = {"ping_intern": [], "ping_ft": []}
+    ping_candidates = []
     ts = now()
     for b, j in jobs:
         cat = _category(j["title"])
         # watchlist matches company only — titles like 'Salesforce Developer
         # Intern' at a consultancy must not count
-        if watch and watch.search(j.get("company") or b):
-            tiers["ping_intern" if cat == "intern" else "ping_ft"].append((b, j))
+        if (watch and watch.search(j.get("company") or b)
+                and cat in sub["ping_categories"]):
+            ping_candidates.append((b, j))
         con.execute(
             "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
             (sub["name"], "intern" if cat == "intern" else "ft", ts,
@@ -1009,18 +1026,38 @@ def deliver(sub, jobs, con):
              j["url"], j.get("location") or "", j.get("salary") or "",
              j.get("posted")))
 
+    # Keep loud alerts scarce and useful. Early-career roles sort first, then
+    # the freshest postings; every omitted match is still retained in the
+    # complete quiet feeds above.
+    priority = {"intern": 0, "new_grad": 1, "other": 2}
+    ping_candidates.sort(key=lambda pair: (
+        priority[_category(pair[1]["title"])],
+        -(_posted_epoch(pair[1].get("posted")) or 0),
+        (pair[1].get("company") or pair[0]).casefold(),
+        pair[1]["title"].casefold()))
+    limit = sub["max_ping_jobs"]
+    selected = ping_candidates[:limit]
+    omitted = len(ping_candidates) - len(selected)
+    tiers = {"ping_intern": [], "ping_ft": []}
+    for pair in selected:
+        cat = _category(pair[1]["title"])
+        tiers["ping_intern" if cat == "intern" else "ping_ft"].append(pair)
+
     main = sub["discord"]
     ok = True
     if tiers["ping_intern"]:
         hook = sub["ping_hooks"].get("intern") or main
         if hook:
             ok &= send_discord_ping(hook, tiers["ping_intern"],
-                                    "internship", mention=sub["mention"])
+                                    "internship", mention=sub["mention"],
+                                    omitted=omitted)
+            omitted = 0
     if tiers["ping_ft"]:
         hook = sub["ping_hooks"].get("full_time") or main
         if hook:
             ok &= send_discord_ping(hook, tiers["ping_ft"],
-                                    "role", mention=sub["mention"])
+                                    "role", mention=sub["mention"],
+                                    omitted=omitted)
     hot_all = tiers["ping_intern"] + tiers["ping_ft"]
     if sub["telegram_chat"] and hot_all:
         ok &= send_telegram(sub["telegram_chat"],
@@ -1313,6 +1350,16 @@ def cmd_check(config):
             if c != "all" and c not in config["boards"]:
                 print(f"✗ subscriber {name}: unknown company '{c}'")
                 errs += 1
+        categories = s.get("ping_categories", ["intern", "new_grad", "other"])
+        invalid = set(categories) - {"intern", "new_grad", "other"}
+        if invalid:
+            print(f"✗ subscriber {name}: unknown ping categories "
+                  f"{', '.join(sorted(invalid))}")
+            errs += 1
+        cap = s.get("max_ping_jobs", 10)
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
+            print(f"✗ subscriber {name}: max_ping_jobs must be a non-negative integer")
+            errs += 1
         if not s.get("discord_webhook") and not s.get("telegram_chat_id"):
             print(f"⚠ subscriber {name}: no delivery channel configured")
     n_boards = sum(1 for k in config["boards"] if not k.startswith("_"))
@@ -1351,19 +1398,19 @@ def cmd_test(config, who):
     if sub["discord"]:
         send_discord_note(
             sub["discord"], "🧪 jobwatch test — every delivery scenario",
-            "How this works, in one line: **anything from a watchlist "
-            "company buzzes you; everything lands quietly in the feeds.**"
+            "How this works, in one line: **high-signal watchlist roles "
+            "buzz you; every match lands quietly in the feeds.**"
             "\n\nThe next messages demo it with fake jobs:\n\n"
             "**1. 🎯 apply-now intern (LOUD, gold cards)** — internships at "
             "watchlist companies → Stripe, Jane Street\n"
-            "**2. 🎯 apply-now full-time (LOUD, orange cards)** — ANY other "
-            "role at a watchlist company → Databricks (new grad), "
-            "Anthropic (2026 start)\n"
+            "**2. 🎯 apply-now full-time (LOUD, orange cards)** — new-grad "
+            "roles at watchlist companies → Databricks\n"
             "**3. 🛠️ internships feed (@silent)** — EVERY internship incl. "
             "the apply-now ones (⭐ = watchlist company) → ⭐ Stripe, "
             "⭐ Jane Street, SomeCo\n"
             "**4. 💼 full-time feed (@silent)** — every other role, same "
             "idea → ⭐ Databricks, ⭐ Anthropic, RandomCorp\n"
+            "Loud cards are capped; overflow stays in these feeds.\n"
             "\nThat's the whole system.",
             0x9B59B6)
     nowt = time.time()
