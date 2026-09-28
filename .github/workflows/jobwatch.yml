@@ -28,13 +28,17 @@ jobs:
           cache: pip
       - name: require delivery secret
         env:
-          DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
+          DISCORD_WEBHOOK_FULLTIME: ${{ secrets.DISCORD_WEBHOOK_FULLTIME }}
         run: |
-          if [ -z "$DISCORD_WEBHOOK_SHAUN" ]; then
-            echo "::error::Repo secret DISCORD_WEBHOOK_SHAUN is not set (Settings → Secrets and variables → Actions). Failing so alerts aren't silently dropped."
+          if [ -z "$DISCORD_WEBHOOK_FULLTIME" ]; then
+            echo "::error::Repo secret DISCORD_WEBHOOK_FULLTIME is not set (Settings → Secrets and variables → Actions). Failing so alerts and ops notices aren't silently dropped."
             exit 1
           fi
       - run: pip install -r requirements.txt
+      - name: run unit tests and validate configuration
+        run: |
+          python -m unittest -v
+          python watcher.py --check
       - name: restore state
         # state lives on the force-pushed `state` branch so main stays clean
         run: |
@@ -48,7 +52,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          DISCORD_WEBHOOK_SHAUN: ${{ secrets.DISCORD_WEBHOOK_SHAUN }}
           DISCORD_WEBHOOK_APPLY_INTERN: ${{ secrets.DISCORD_WEBHOOK_APPLY_INTERN }}
           DISCORD_WEBHOOK_APPLY_FULLTIME: ${{ secrets.DISCORD_WEBHOOK_APPLY_FULLTIME }}
           DISCORD_WEBHOOK_INTERN: ${{ secrets.DISCORD_WEBHOOK_INTERN }}
