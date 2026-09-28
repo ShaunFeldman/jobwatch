@@ -57,10 +57,12 @@ class PortableStateTests(unittest.TestCase):
         }))
         restored = self.database()
         watcher.import_state(restored)
-        self.assertEqual("old-job", restored.execute(
-            "SELECT job_id FROM jobs").fetchone()[0])
-        self.assertEqual("url:example.test/old-job", restored.execute(
-            "SELECT key FROM alerted").fetchone()[0])
+        self.assertEqual(
+            "old-job",
+            restored.execute("SELECT job_id FROM jobs").fetchone()[0])
+        self.assertEqual(
+            "url:example.test/old-job",
+            restored.execute("SELECT key FROM alerted").fetchone()[0])
 
 
 class NotificationQualityTests(unittest.TestCase):
@@ -73,30 +75,74 @@ class NotificationQualityTests(unittest.TestCase):
     def test_loud_alert_cap_keeps_every_job_in_quiet_feed(self, send_ping):
         with patch.object(watcher, "DB_PATH", ":memory:"):
             con = watcher.db_open()
+
         sub = {
-            "name": "test", "watch": re.compile("cool", re.I),
-            "ping_categories": {"intern", "new_grad"}, "max_ping_jobs": 2,
-            "discord": "hook", "ping_hooks": {}, "feeds": {},
-            "mention": "", "telegram_chat": "",
+            "name": "test",
+            "watch": re.compile("cool", re.I),
+            "ping_categories": {"intern", "new_grad"},
+            "max_ping_jobs": 2,
+            "discord": "hook",
+            "ping_hooks": {},
+            "feeds": {},
+            "mention": "",
+            "telegram_chat": "",
         }
         jobs = [
-            ("cool", {"id": "1", "company": "Cool AI", "title": "SWE Intern",
-                      "location": "Remote", "url": "https://x/1", "posted": 100}),
-            ("cool", {"id": "2", "company": "Cool AI", "title": "New Grad SWE",
-                      "location": "NY", "url": "https://x/2", "posted": 300}),
-            ("cool", {"id": "3", "company": "Cool AI", "title": "Junior Engineer",
-                      "location": "NY", "url": "https://x/3", "posted": 200}),
-            ("cool", {"id": "4", "company": "Cool AI", "title": "Software Engineer",
-                      "location": "NY", "url": "https://x/4", "posted": 400}),
+            ("cool", {
+                "id": "1",
+                "company": "Cool AI",
+                "title": "SWE Intern",
+                "location": "Remote",
+                "url": "https://x/1",
+                "posted": 100,
+            }),
+            ("cool", {
+                "id": "2",
+                "company": "Cool AI",
+                "title": "New Grad SWE",
+                "location": "NY",
+                "url": "https://x/2",
+                "posted": 300,
+            }),
+            ("cool", {
+                "id": "3",
+                "company": "Cool AI",
+                "title": "Junior Engineer",
+                "location": "NY",
+                "url": "https://x/3",
+                "posted": 200,
+            }),
+            ("cool", {
+                "id": "4",
+                "company": "Cool AI",
+                "title": "Software Engineer",
+                "location": "NY",
+                "url": "https://x/4",
+                "posted": 400,
+            }),
         ]
 
         self.assertTrue(watcher.deliver(sub, jobs, con))
-        loud_jobs = [job for call in send_ping.call_args_list
-                     for _, job in call.args[1]]
-        self.assertEqual(["1", "2"], sorted(job["id"] for job in loud_jobs))
-        self.assertEqual(4, con.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
-        self.assertTrue(any(call.kwargs["omitted"] == 1
-                            for call in send_ping.call_args_list))
+
+        loud_jobs = [
+            job
+            for call in send_ping.call_args_list
+            for _, job in call.args[1]
+        ]
+        self.assertEqual(
+            ["1", "2"],
+            sorted(job["id"] for job in loud_jobs),
+        )
+        self.assertEqual(
+            4,
+            con.execute("SELECT COUNT(*) FROM pending").fetchone()[0],
+        )
+        self.assertTrue(
+            any(
+                call.kwargs["omitted"] == 1
+                for call in send_ping.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":
