@@ -568,14 +568,23 @@ def board_row(con, board):
 
 # ---- portable state (GitHub Actions mode) ----
 def export_state(con):
-    state = {"boards": {}, "alerted": []}
+    """Export the durable subset of SQLite without refreshing record ages.
+
+    Actions starts with a new database on every run.  Persisting only IDs (as
+    older state files did) made every imported row look newly seen, so the
+    90-day pruning window could never expire and state.json grew forever.
+    """
+    state = {"version": 2, "boards": {}, "alerted": []}
     for board, seeded, last_poll, failures in con.execute(
             "SELECT board, seeded, last_poll, failures FROM boards"):
-        ids = sorted(known_ids(con, board))
-        state["boards"][board] = {"seeded": seeded, "ids": ids,
+        jobs = [list(r) for r in con.execute(
+            "SELECT job_id, last_seen FROM jobs WHERE board=? ORDER BY job_id",
+            (board,))]
+        state["boards"][board] = {"seeded": seeded, "jobs": jobs,
                                   "lp": int(last_poll or 0),
                                   "f": failures or 0}
-    state["alerted"] = [r[0] for r in con.execute("SELECT key FROM alerted")]
+    state["alerted"] = [list(r) for r in con.execute(
+        "SELECT key, ts FROM alerted ORDER BY key")]
     state["recent"] = [list(r) for r in con.execute(
         "SELECT ts, company, title, url, location, salary FROM recent")]
     state["pending"] = [list(r) for r in con.execute(
@@ -595,11 +604,21 @@ def import_state(con):
             "INSERT OR REPLACE INTO boards(board, seeded, last_poll, failures) "
             "VALUES (?,?,?,?)",
             (board, b.get("seeded", 1), b.get("lp", 0), b.get("f", 0)))
+        # v1 stored only ``ids``.  Accept it once for a seamless migration;
+        # v2 retains last_seen so stale jobs can actually age out.
+        jobs = b.get("jobs")
+        if jobs is None:
+            jobs = [(job_id, ts) for job_id in b.get("ids", [])]
         con.executemany(
             "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?,?)",
-            [(board, i, "", "", "", ts, ts) for i in b.get("ids", [])])
-    con.executemany("INSERT OR IGNORE INTO alerted VALUES (?,?)",
-                    [(k, ts) for k in state.get("alerted", [])])
+            [(board, str(r[0]), "", "", "", r[1] or ts, r[1] or ts)
+             for r in jobs if r])
+    alerted = state.get("alerted", [])
+    con.executemany(
+        "INSERT OR IGNORE INTO alerted VALUES (?,?)",
+        [(str(r[0]), (r[1] if len(r) > 1 else ts))
+         if isinstance(r, (list, tuple)) else (str(r), ts)
+         for r in alerted if r])
     con.executemany("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     [tuple(r) + ("",) * (6 - len(r))
                      for r in state.get("recent", [])])
