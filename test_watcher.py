@@ -4,9 +4,44 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import watcher
+
+
+class SourceAdapterTests(unittest.TestCase):
+    def test_board_fetch_retries_transient_transport_failure(self):
+        adapter = Mock(side_effect=[watcher.requests.Timeout("slow"), [{
+            "id": "1", "title": "Software Engineer", "location": "US",
+            "url": "https://example.com/1",
+        }]])
+        with patch.dict(watcher.ADAPTERS, {"transient": adapter}), \
+                patch("watcher.time.sleep"):
+            name, jobs = watcher.fetch_board("demo_company", {"ats": "transient"})
+        self.assertEqual("demo_company", name)
+        self.assertEqual("demo company", jobs[0]["company"])
+        self.assertEqual(2, adapter.call_count)
+
+    @patch("watcher.requests.get")
+    def test_marqeta_first_party_table_parser(self, get):
+        response = Mock()
+        response.text = """
+          <a class="table-row" href="/careers/9a76aad5-9a09-4b0d-be6c-51e9ed90a20d">
+            <td class="title">Cloud Database Engineer II</td>
+            <td>Cloud Platform</td>
+            <td>Remote - Ontario OR British Columbia</td>
+          </a>
+        """
+        response.raise_for_status.return_value = None
+        get.return_value = response
+
+        jobs = watcher.fetch_marqeta({"ats": "marqeta"})
+
+        self.assertEqual(1, len(jobs))
+        self.assertEqual("Cloud Database Engineer II", jobs[0]["title"])
+        self.assertEqual("Remote - Ontario OR British Columbia", jobs[0]["location"])
+        self.assertEqual("Marqeta", jobs[0]["company"])
+        self.assertTrue(jobs[0]["url"].startswith("https://www.marqeta.com/careers/"))
 
 
 class PortableStateTests(unittest.TestCase):

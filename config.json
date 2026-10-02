@@ -6,6 +6,19 @@
   "digest_hour_utc": 13,
   "healthcheck_url": "",
 
+  "profile": {
+    "name": "Shaun's search",
+    "headline": "2027 SWE, quant & startup roles · U.S. first, Canada too",
+    "_note": "Dashboard ranking only: collection stays broad and notification filters remain below. Every score is explainable and can be retuned without changing code.",
+    "track_weights": {"software": 18, "quant": 20, "data_ml": 15, "finance": 6, "hardware": 4, "product": 3, "operations": 2, "design": 0, "sales": -4, "people_legal": -6, "other": 0},
+    "seniority_weights": {"internship": 20, "new_grad": 16, "entry": 8, "experienced": -5, "senior": -30},
+    "location_weights": {"us": 12, "canada": 8, "remote": 9, "other": -15, "unknown": 0},
+    "company_type_weights": {"startup": 7, "quant": 7, "fintech": 3},
+    "year_weights": {"2027": 7, "2026": -15, "2028": -3},
+    "education_penalties": {"phd": -25, "masters": -8},
+    "skills": {"rust": 8, "distributed": 7, "database": 6, "backend": 5, "cloud": 4, "aws": 5, "python": 4, "c++": 5, "machine learning": 4, "systems": 4, "infrastructure": 4, "trading": 4, "research": 3}
+  },
+
   "filters": {
     "_include_note": "Hybrid gate (set 2026-08-14): early-career markers (intern/new-grad/junior/co-op/20xx) PLUS a whitelist of core-technical role titles (software engineer, ML engineer, data scientist, etc.) so plainly-titled new-grad roles from the curated repos come through. Bare role words alone (engineer/developer/research/quant) are NOT included — those matched every experienced-hire posting (~72% of loud pings, the 2026-07-21 over-notification). Senior/staff/II/III variants are still caught by the exclude filter, so the core-technical titles don't re-admit senior roles. To go back to strict early-career-only, drop everything from '|software engineer' onward.",
     "include": "(intern|internship|new ?grad|newgrad|graduate|university|campus|entry.level|early.career|\\b20(26|27|28)\\b|junior|apprentice|co-?op|software engineer|software developer|software development engineer|machine learning engineer|data scientist|founding engineer|research engineer|quantitative (researcher|trader|developer))",
@@ -107,7 +120,8 @@
     "anthropic":      { "ats": "greenhouse", "token": "anthropic" },
     "openai":         { "ats": "ashby",      "token": "openai" },
     "xai":            { "ats": "greenhouse", "token": "xai" },
-    "deepmind":       { "ats": "greenhouse", "token": "deepmind" },
+    "deepmind":       { "ats": "greenhouse", "token": "deepmind", "disabled": true,
+                        "_note": "Google DeepMind now routes openings through Google Careers and has no separate public board API; direct roles remain covered by the aggregator sources." },
     "scale_ai":       { "ats": "greenhouse", "token": "scaleai" },
     "perplexity":     { "ats": "ashby",      "token": "perplexity" },
     "cohere":         { "ats": "ashby",      "token": "cohere" },
@@ -186,7 +200,7 @@
     "checkr":         { "ats": "greenhouse", "token": "checkr" },
     "gemini":         { "ats": "greenhouse", "token": "gemini" },
     "fireblocks":     { "ats": "greenhouse", "token": "fireblocks" },
-    "marqeta":        { "ats": "greenhouse", "token": "marqeta" },
+    "marqeta":        { "ats": "marqeta", "url": "https://www.marqeta.com" },
     "lithic":         { "ats": "greenhouse", "token": "lithic" },
     "alloy":          { "ats": "greenhouse", "token": "alloy" },
     "betterment":     { "ats": "greenhouse", "token": "betterment" },
@@ -202,7 +216,7 @@
     "glossier":       { "ats": "greenhouse", "token": "glossier" },
 
     "_startups_infra_data": "--- dev tools, data & infra (fits distributed-systems background) ---",
-    "clickhouse":     { "ats": "greenhouse", "token": "clickhouse" },
+    "clickhouse":     { "ats": "ashby", "token": "clickhouse" },
     "cockroach_labs": { "ats": "greenhouse", "token": "cockroachlabs" },
     "fivetran":       { "ats": "greenhouse", "token": "fivetran" },
     "hightouch":      { "ats": "greenhouse", "token": "hightouch" },
@@ -210,8 +224,8 @@
     "launchdarkly":   { "ats": "greenhouse", "token": "launchdarkly" },
     "planetscale":    { "ats": "greenhouse", "token": "planetscale" },
     "starburst":      { "ats": "greenhouse", "token": "starburst" },
-    "postman":        { "ats": "greenhouse", "token": "postman" },
-    "amplitude":      { "ats": "greenhouse", "token": "amplitude" },
+    "postman":        { "ats": "workday", "host": "postman.wd108.myworkdayjobs.com", "tenant": "postman", "site": "careers", "min_interval": 900 },
+    "amplitude":      { "ats": "ashby", "token": "amplitude" },
     "mixpanel":       { "ats": "greenhouse", "token": "mixpanel" },
     "webflow":        { "ats": "greenhouse", "token": "webflow" },
     "smartsheet":     { "ats": "greenhouse", "token": "smartsheet" },
@@ -235,7 +249,7 @@
     "nasdaq":         { "ats": "workday", "host": "nasdaq.wd1.myworkdayjobs.com", "tenant": "nasdaq", "site": "Global_External_Site", "search": "", "min_interval": 1800 },
     "zoom":           { "ats": "workday", "host": "zoom.wd5.myworkdayjobs.com", "tenant": "zoom", "site": "Zoom", "search": "", "min_interval": 1800 },
     "hp":             { "ats": "workday", "host": "hp.wd5.myworkdayjobs.com", "tenant": "hp", "site": "ExternalCareerSite", "search": "", "min_interval": 1800 },
-    "comcast":        { "ats": "workday", "host": "comcast.wd5.myworkdayjobs.com", "tenant": "comcast", "site": "Comcast_Careers", "search": "", "min_interval": 1800 },
+    "comcast":        { "ats": "workday", "host": "comcast.wd115.myworkdayjobs.com", "tenant": "comcast", "site": "Comcast_Careers", "search": "", "min_interval": 1800 },
     "target":         { "ats": "workday", "host": "target.wd5.myworkdayjobs.com", "tenant": "target", "site": "targetcareers", "search": "", "min_interval": 1800 },
 
     "_aggregators": "--- community repos: hundreds of companies incl. bespoke boards (Jane Street, Google, Meta, Apple, banks). JSON repos use the Simplify listings format; markdown repos are parsed via github_md with per-repo column maps (cols = 0-based indexes). ---",

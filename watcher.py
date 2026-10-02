@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-jobwatch v4 — multi-user, multi-source job posting watcher.
+jobwatch v5 — broad-market watcher and local career command center.
 
 Sources: Greenhouse / Lever / Ashby / SmartRecruiters / Workday / Eightfold
 boards, amazon.jobs, Microsoft careers, LinkedIn guest search, community
@@ -13,6 +13,7 @@ twice. Discord delivery uses embeds grouped by company (no link-preview spam).
     python watcher.py --verify           # hit every board once, report ok/404
     python watcher.py --list stripe      # dump one board (token debug)
     python watcher.py --test shaun       # send test message to a subscriber
+    python watcher.py --serve            # open the local dashboard
     python watcher.py --once             # one cycle (GitHub Actions mode; exports state.json)
     python watcher.py                    # loop forever (VPS/systemd mode)
 
@@ -47,7 +48,7 @@ STATE_JSON = HERE / "state.json"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 TIMEOUT = 25
 PRUNE_AFTER_DAYS = 90   # dedupe memory: a job re-posted after this alerts again
-RECENT_DAYS = 14        # how far back the job-board page reaches
+RECENT_DAYS = 14        # compact digest history; full jobs live for 90 days
 ZERO_GUARD_MIN = 5
 SEND_RETRIES = 3
 
@@ -312,6 +313,35 @@ def _cell_url(cell):
     return m.group(0).rstrip(".,;") if m else ""
 
 
+def fetch_marqeta(cfg):
+    """Marqeta's official careers page exposes its live openings as a
+    semantic HTML table.  Their former Greenhouse board is no longer public,
+    so parsing that first-party table is more reliable than a stale token."""
+    base = cfg.get("url", "https://www.marqeta.com")
+    path = cfg.get("path", "/company/careers")
+    r = requests.get(base.rstrip("/") + path, headers={"User-Agent": UA},
+                     timeout=TIMEOUT)
+    r.raise_for_status()
+    out, seen = [], set()
+    pattern = re.compile(
+        r'<a[^>]+href="(/careers/([0-9a-f-]{20,}))"[^>]*>(.*?)</a>', re.I | re.S)
+    for href, job_id, body in pattern.findall(r.text):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", body, re.I | re.S)
+        if len(cells) < 3 or job_id in seen:
+            continue
+        seen.add(job_id)
+        out.append({
+            "id": job_id,
+            "title": _cell_text(cells[0]),
+            "location": _cell_text(cells[2]),
+            "url": base.rstrip("/") + href,
+            "company": "Marqeta",
+        })
+    if not out:
+        raise ValueError("official Marqeta careers page contained no job rows")
+    return out
+
+
 def fetch_github_md(cfg):
     """Community listing repos that publish a markdown table (speedyapply,
     Canadian lists, off-season lists, ...). cfg: repo, branch (default 'main'),
@@ -535,15 +565,21 @@ ADAPTERS = {
     "eightfold": fetch_eightfold,
     "janestreet": fetch_janestreet,
     "phenom": fetch_phenom,
+    "marqeta": fetch_marqeta,
 }
 
 
 # ================================================================ storage
-def db_open():
-    con = sqlite3.connect(DB_PATH)
+def db_open(path=None):
+    con = sqlite3.connect(path if path is not None else DB_PATH)
+    con.execute("PRAGMA busy_timeout=5000")
     con.execute("""CREATE TABLE IF NOT EXISTS jobs(
         board TEXT, job_id TEXT, title TEXT, location TEXT, url TEXT,
         first_seen TEXT, last_seen TEXT,
+        PRIMARY KEY(board, job_id))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS job_details(
+        board TEXT, job_id TEXT, company TEXT DEFAULT '',
+        salary TEXT DEFAULT '', posted REAL,
         PRIMARY KEY(board, job_id))""")
     con.execute("""CREATE TABLE IF NOT EXISTS boards(
         board TEXT PRIMARY KEY, seeded INTEGER DEFAULT 0,
@@ -560,6 +596,20 @@ def db_open():
         location TEXT DEFAULT '', salary TEXT DEFAULT '', posted REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS kv(
         k TEXT PRIMARY KEY, v TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS applications(
+        job_key TEXT PRIMARY KEY, board TEXT, job_id TEXT, company TEXT,
+        title TEXT, location TEXT DEFAULT '', url TEXT, salary TEXT DEFAULT '',
+        posted REAL, status TEXT DEFAULT 'saved', priority INTEGER DEFAULT 0,
+        notes TEXT DEFAULT '', next_step TEXT DEFAULT '', due_date TEXT DEFAULT '',
+        created_at TEXT, updated_at TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS runs(
+        started_at TEXT, finished_at TEXT, ok_count INTEGER, fail_count INTEGER,
+        skipped_count INTEGER, new_count INTEGER, deduped_count INTEGER,
+        delivered_count INTEGER, duration REAL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS jobs_last_seen ON jobs(last_seen)")
+    con.execute("CREATE INDEX IF NOT EXISTS details_posted ON job_details(posted)")
+    con.execute("CREATE INDEX IF NOT EXISTS applications_status ON applications(status)")
+
     return con
 
 
@@ -620,7 +670,9 @@ def import_state(con):
         if jobs is None:
             jobs = [(job_id, ts) for job_id in b.get("ids", [])]
         con.executemany(
-            "INSERT OR IGNORE INTO jobs VALUES (?,?,?,?,?,?,?)",
+            """INSERT OR IGNORE INTO jobs
+               (board, job_id, title, location, url, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?)""",
             [(board, str(r[0]), "", "", "", r[1] or ts, r[1] or ts)
              for r in jobs if r])
     alerted = state.get("alerted", [])
@@ -1166,7 +1218,19 @@ def maybe_digest(config, con, subs):
 
 # ================================================================ core cycle
 def fetch_board(name, cfg):
-    jobs = ADAPTERS[cfg["ats"]](cfg)
+    for attempt in range(2):
+        try:
+            jobs = ADAPTERS[cfg["ats"]](cfg)
+            break
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt:
+                raise
+            time.sleep(0.75)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if attempt or (status != 429 and status < 500):
+                raise
+            time.sleep(0.75)
     for j in jobs:
         j.setdefault("company", name.replace("_", " "))
     return name, jobs
@@ -1174,6 +1238,7 @@ def fetch_board(name, cfg):
 
 def cycle(config, con):
     t0 = time.time()
+    started_at = now()
     all_boards = {k: v for k, v in config["boards"].items()
                   if not k.startswith("_") and not v.get("disabled")}
     subs = load_subscribers(config.get("filters", {}))
@@ -1220,9 +1285,22 @@ def cycle(config, con):
             fresh = [j for j in jobs if j["id"] and j["id"] not in known]
             ts = now()
             con.executemany(
-                """INSERT INTO jobs VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(board, job_id) DO UPDATE SET last_seen=excluded.last_seen""",
+                """INSERT INTO jobs
+                   (board, job_id, title, location, url, first_seen, last_seen)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(board, job_id) DO UPDATE SET
+                     title=excluded.title, location=excluded.location,
+                     url=excluded.url, last_seen=excluded.last_seen""",
                 [(name, j["id"], j["title"], j["location"], j["url"], ts, ts)
+                 for j in jobs])
+            con.executemany(
+                """INSERT INTO job_details(board, job_id, company, salary, posted)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(board, job_id) DO UPDATE SET
+                     company=excluded.company, salary=excluded.salary,
+                     posted=COALESCE(excluded.posted, job_details.posted)""",
+                [(name, j["id"], j.get("company") or name.replace("_", " "),
+                  j.get("salary") or "", _posted_epoch(j.get("posted")))
                  for j in jobs])
             con.execute("UPDATE boards SET failures=0, last_ok=?, seeded=1 WHERE board=?",
                         (ts, name))
@@ -1300,16 +1378,26 @@ def cycle(config, con):
 
     con.execute("DELETE FROM jobs WHERE last_seen < datetime('now', ?)",
                 (f"-{PRUNE_AFTER_DAYS} days",))
+    con.execute("""DELETE FROM job_details WHERE NOT EXISTS (
+                   SELECT 1 FROM jobs WHERE jobs.board=job_details.board
+                   AND jobs.job_id=job_details.job_id)""")
     con.execute("DELETE FROM alerted WHERE ts < datetime('now', ?)",
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
                 (f"-{RECENT_DAYS} days",))
     con.execute("DELETE FROM pending WHERE ts < datetime('now', '-7 days')")
+    duration = time.time() - t0
+    con.execute(
+        "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
+        (started_at, now(), ok_count, fail_count, skipped, total_new,
+         deduped, delivered, duration))
+    con.execute("""DELETE FROM runs WHERE rowid NOT IN
+                   (SELECT rowid FROM runs ORDER BY rowid DESC LIMIT 1000)""")
     con.commit()
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
         f"{total_new} new, {deduped} cross-source dupes, {agencies} agency-spam, "
-        f"{delivered} deliveries | {time.time()-t0:.1f}s")
+        f"{delivered} deliveries | {duration:.1f}s")
 
     hc = os.environ.get("HEALTHCHECK_URL", config.get("healthcheck_url", ""))
     if hc and (ok_count > 0):
@@ -1328,6 +1416,16 @@ def cmd_check(config):
     except re.error as e:
         print(f"✗ global filters: bad regex: {e}")
         errs += 1
+    profile = config.get("profile", {})
+    for section in ("track_weights", "seniority_weights", "location_weights",
+                    "company_type_weights", "year_weights", "skills",
+                    "education_penalties"):
+        values = profile.get(section, {})
+        if not isinstance(values, dict) or any(
+                isinstance(v, bool) or not isinstance(v, (int, float))
+                for v in values.values()):
+            print(f"✗ profile {section}: values must be numeric weights")
+            errs += 1
     for name, b in config["boards"].items():
         if name.startswith("_"):
             continue
@@ -1383,8 +1481,11 @@ def cmd_verify(config):
             except Exception as e:
                 print(f"✗ {name:22} {type(e).__name__}: {str(e)[:90]}")
                 bad += 1
-    print(f"\n{good} working, {bad} broken. Fix tokens for broken boards "
-          f"(careers page URL) or set \"disabled\": true.")
+    if bad:
+        print(f"\n{good} working, {bad} broken. Fix tokens for broken boards "
+              f"(careers page URL) or set \"disabled\": true.")
+    else:
+        print(f"\n{good} working, 0 broken — every enabled source is healthy.")
 
 
 def cmd_test(config, who):
@@ -1453,6 +1554,14 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--list", metavar="BOARD")
     ap.add_argument("--test", metavar="SUBSCRIBER")
+    ap.add_argument("--serve", action="store_true",
+                    help="open the local daily-use dashboard")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="dashboard host (default: loopback only)")
+    ap.add_argument("--port", type=int, default=8787,
+                    help="dashboard port (default: 8787)")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="do not open the dashboard in a browser")
     args = ap.parse_args()
 
     config = json.loads(Path(args.config).read_text())
@@ -1471,6 +1580,11 @@ def main():
             print(f"{(j.get('company') or '')[:18]:18} | {j['title']!r:55.55} | "
                   f"{j['location']!r:28.28} | {j['url'][:60]}")
         print(f"\n{len(jobs)} live postings")
+        return
+    if args.serve:
+        from dashboard import serve
+        serve(args.host, args.port, not args.no_browser,
+              DB_PATH, Path(args.config), SUBSCRIBERS)
         return
 
     # single-instance lock (POSIX)

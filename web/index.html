@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f4f3ee">
+  <title>Jobwatch — Career command center</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="#overview" aria-label="Jobwatch home">
+        <span class="brand-mark">J<span>W</span></span>
+        <span><strong>jobwatch</strong><small>command center</small></span>
+      </a>
+      <nav class="nav">
+        <button class="nav-item active" data-view="overview"><span>⌂</span> Today</button>
+        <button class="nav-item" data-view="discover"><span>⌕</span> Discover <b id="nav-job-count">—</b></button>
+        <button class="nav-item" data-view="pipeline"><span>◫</span> Pipeline <b id="nav-pipeline-count">—</b></button>
+        <button class="nav-item" data-view="sources"><span>⌁</span> Sources</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="pulse"><i></i><span><strong>Watcher status</strong><small id="watcher-status">Waiting for first run</small></span></div>
+        <p>Private by default.<br>Your notes stay on this device.</p>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button class="mobile-menu" aria-label="Toggle menu">☰</button>
+        <div class="topbar-title"><span id="eyebrow-date"></span><strong id="page-title">Today</strong></div>
+        <div class="topbar-actions">
+          <button class="icon-button" id="refresh-button" title="Refresh data" aria-label="Refresh data">↻</button>
+          <a class="button secondary" id="export-button" href="/api/export.csv">Export CSV</a>
+          <button class="button primary" id="browse-button">Browse matches <span>→</span></button>
+        </div>
+      </header>
+
+      <section class="view active" id="view-overview">
+        <div class="hero">
+          <div class="hero-copy">
+            <span class="kicker">YOUR DAILY BRIEFING</span>
+            <h1>Good morning, Shaun.<br><em>Let’s find the right move.</em></h1>
+            <p id="profile-headline">SWE, quant, and high-growth startup roles, ranked around your goals.</p>
+            <div class="hero-actions">
+              <button class="button ink" id="hero-review">Review top matches <span>→</span></button>
+              <button class="text-button" data-view-target="pipeline">Open application board</button>
+            </div>
+          </div>
+          <div class="hero-orbit" aria-hidden="true">
+            <div class="orbit-ring one"></div><div class="orbit-ring two"></div>
+            <div class="orbit-core"><span id="hero-score">—</span><small>high-fit<br>roles</small></div>
+            <i class="dot d1"></i><i class="dot d2"></i><i class="dot d3"></i>
+          </div>
+        </div>
+
+        <div class="stat-grid" id="stats">
+          <article class="stat-card"><span class="stat-icon coral">↗</span><div><small>Fresh today</small><strong>—</strong><p>posted in the last 24 hours</p></div></article>
+          <article class="stat-card"><span class="stat-icon blue">✦</span><div><small>Strong matches</small><strong>—</strong><p>scored 80 or higher</p></div></article>
+          <article class="stat-card"><span class="stat-icon green">✓</span><div><small>Active pipeline</small><strong>—</strong><p>saved through offer</p></div></article>
+          <article class="stat-card"><span class="stat-icon gold">⌁</span><div><small>Sources healthy</small><strong>—</strong><p>checked without errors</p></div></article>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel recommendations-panel">
+            <div class="panel-head"><div><span class="kicker">PRIORITY QUEUE</span><h2>Worth your attention</h2></div><button class="text-button" data-view-target="discover">See all jobs →</button></div>
+            <div id="recommendations" class="recommendation-list loading-list"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div>
+          </section>
+          <aside class="panel focus-panel">
+            <div class="panel-head"><div><span class="kicker">MOMENTUM</span><h2>Your pipeline</h2></div></div>
+            <div class="pipeline-donut"><div class="donut" id="pipeline-donut"><span id="pipeline-total">0</span><small>tracked</small></div></div>
+            <div class="pipeline-legend" id="pipeline-legend"></div>
+            <button class="button full secondary" data-view-target="pipeline">Manage applications</button>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-discover">
+        <div class="section-intro">
+          <div><span class="kicker">THE FULL MARKET</span><h1>Discover roles</h1><p>Broad coverage, focused ranking. Every role stays searchable.</p></div>
+          <div class="result-total"><strong id="result-count">—</strong><span>matches</span></div>
+        </div>
+        <div class="filter-bar">
+          <label class="search-box"><span>⌕</span><input id="search-input" type="search" placeholder="Search role, company, skill, or city…" autocomplete="off"></label>
+          <select id="location-filter" aria-label="Location"><option value="">All locations</option><option value="us">United States</option><option value="canada">Canada</option><option value="remote">Remote</option><option value="other">Other</option></select>
+          <select id="seniority-filter" aria-label="Career stage"><option value="">All stages</option><option value="internship">Internship</option><option value="new_grad">New grad</option><option value="entry">Entry level</option><option value="experienced">Experienced</option><option value="senior">Senior</option></select>
+          <select id="sort-filter" aria-label="Sort jobs"><option value="score">Best fit</option><option value="newest">Newest</option><option value="company">Company A–Z</option></select>
+        </div>
+        <div class="track-tabs" id="track-tabs">
+          <button class="active" data-track="">Everything</button>
+          <button data-track="software">Software</button>
+          <button data-track="quant">Quant</button>
+          <button data-track="data_ml">AI & data</button>
+          <button data-track="finance">Finance</button>
+          <button data-track="product">Product</button>
+          <button data-track="design">Design</button>
+          <button data-track="operations">Operations</button>
+          <button data-track="other">Other</button>
+        </div>
+        <div class="quick-filters">
+          <label><input type="checkbox" id="startup-filter"><span>Startup only</span></label>
+          <label><input type="checkbox" id="fresh-filter"><span>Posted today</span></label>
+          <label><input type="checkbox" id="high-fit-filter"><span>80+ fit</span></label>
+        </div>
+        <div id="job-list" class="job-list"><div class="empty-state"><div class="spinner"></div><h3>Building your shortlist…</h3></div></div>
+        <div class="pagination" id="pagination"></div>
+      </section>
+
+      <section class="view" id="view-pipeline">
+        <div class="section-intro">
+          <div><span class="kicker">APPLICATION CRM</span><h1>Keep every opportunity moving</h1><p>Save the next action, not just the link.</p></div>
+          <button class="button secondary" data-view-target="discover">+ Find roles</button>
+        </div>
+        <div class="kanban" id="kanban"></div>
+      </section>
+
+      <section class="view" id="view-sources">
+        <div class="section-intro">
+          <div><span class="kicker">COVERAGE & RELIABILITY</span><h1>Source health</h1><p>Every company board and aggregator, with failures made visible.</p></div>
+          <div class="source-summary" id="source-summary"></div>
+        </div>
+        <div class="source-tools"><label class="search-box compact"><span>⌕</span><input id="source-search" type="search" placeholder="Filter sources…"></label><div class="status-key"><i class="ok"></i> Healthy <i class="idle"></i> Not checked <i class="bad"></i> Needs attention</div></div>
+        <div class="source-table-wrap"><table class="source-table"><thead><tr><th>Source</th><th>Adapter</th><th>Tags</th><th>Last success</th><th>Status</th></tr></thead><tbody id="source-rows"></tbody></table></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="application-dialog">
+    <form method="dialog" id="application-form">
+      <button class="dialog-close" value="cancel" aria-label="Close">×</button>
+      <span class="kicker">APPLICATION DETAILS</span>
+      <h2 id="dialog-title">Track this role</h2><p id="dialog-company"></p>
+      <input type="hidden" id="dialog-key">
+      <label>Status<select id="dialog-status"><option value="saved">Saved</option><option value="applied">Applied</option><option value="interview">Interview</option><option value="offer">Offer</option><option value="rejected">Rejected</option><option value="archived">Archived</option></select></label>
+      <label>Next step<input id="dialog-next-step" placeholder="e.g. Message recruiter, prep system design"></label>
+      <label>Due date<input id="dialog-due-date" type="date"></label>
+      <label>Notes<textarea id="dialog-notes" rows="5" placeholder="Contacts, interview details, questions, follow-ups…"></textarea></label>
+      <div class="dialog-actions"><button type="button" class="text-button danger" id="delete-application">Remove from pipeline</button><button class="button primary" value="save">Save changes</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

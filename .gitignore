@@ -1,4 +1,4 @@
-jobwatch.db
+jobwatch.db*
 __pycache__/
 .watcher.lock
 state.json
