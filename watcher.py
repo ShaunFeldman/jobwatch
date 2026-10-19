@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import os
 import random
 import re
@@ -64,23 +65,40 @@ def log(msg):
 
 
 # ---- posting freshness: adapters set job["posted"] = epoch seconds ----
-def _iso_epoch(s):
-    if not s:
+def _iso_epoch(value):
+    if not value:
         return None
     try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        # Amazon publishes calendar dates rather than ISO timestamps.
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                parsed = datetime.strptime(str(value), fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
         return None
 
 
 def _posted_epoch(value):
-    """Normalize adapter timestamps, which may be epoch numbers or ISO text."""
-    if value is None or value == "":
+    """Normalize dates without letting invalid or millisecond values look new."""
+    if value is None or value == "" or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        epoch = float(value)
     except (TypeError, ValueError):
-        return _iso_epoch(value)
+        epoch = _iso_epoch(value)
+    if epoch is None or not math.isfinite(epoch) or epoch <= 0:
+        return None
+    return epoch / 1000 if epoch > 100_000_000_000 else epoch
 
 
 def _workday_posted_epoch(text):
@@ -220,7 +238,7 @@ def fetch_greenhouse(cfg):
         "title": j.get("title", ""),
         "location": (j.get("location") or {}).get("name", ""),
         "url": j.get("absolute_url", ""),
-        "posted": _iso_epoch(j.get("first_published") or j.get("updated_at")),
+        "posted": _iso_epoch(j.get("first_published")),
     } for j in r.json()["jobs"]]
 
 
@@ -348,7 +366,7 @@ def fetch_github_listings(cfg):
             "location": " | ".join(locs),
             "url": j.get("url", ""),
             "company": j.get("company_name", ""),
-            "posted": j.get("date_posted") or j.get("date_updated") or None,
+            "posted": _posted_epoch(j.get("date_posted")),
         })
     return out
 
@@ -675,6 +693,14 @@ def db_open(path=None):
     con.execute("""CREATE TABLE IF NOT EXISTS pending(
         sub TEXT, tier TEXT, ts TEXT, company TEXT, title TEXT, url TEXT,
         location TEXT DEFAULT '', salary TEXT DEFAULT '', posted REAL)""")
+    for table, additions in {
+        "pending": {"expires_at": "REAL", "freshness_note": "TEXT DEFAULT ''"},
+        "outbox": {"expires_at": "REAL"},
+    }.items():
+        existing = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for column, definition in additions.items():
+            if column not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     con.execute("""CREATE TABLE IF NOT EXISTS kv(
         k TEXT PRIMARY KEY, v TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS applications(
@@ -715,7 +741,7 @@ def export_state(con):
     older state files did) made every imported row look newly seen, so the
     90-day pruning window could never expire and state.json grew forever.
     """
-    state = {"version": 3, "boards": {}, "alerted": []}
+    state = {"version": 4, "boards": {}, "alerted": []}
     for board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll in con.execute(
             "SELECT board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll FROM boards"):
         jobs = [list(r) for r in con.execute(
@@ -731,10 +757,10 @@ def export_state(con):
     state["recent"] = [list(r) for r in con.execute(
         "SELECT ts, company, title, url, location, salary FROM recent")]
     state["pending"] = [list(r) for r in con.execute(
-        "SELECT sub, tier, ts, company, title, url, location, salary, posted "
+        "SELECT sub, tier, ts, company, title, url, location, salary, posted, expires_at, freshness_note "
         "FROM pending")]
     state["outbox"] = [list(r) for r in con.execute(
-        "SELECT id, sub, route, payload, created_at, attempts, next_try FROM outbox")]
+        "SELECT id, sub, route, payload, created_at, attempts, next_try, expires_at FROM outbox")]
     state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -770,11 +796,11 @@ def import_state(con):
     con.executemany("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     [tuple(r) + ("",) * (6 - len(r))
                      for r in state.get("recent", [])])
-    con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
-                    [tuple(r) + (None,) * (9 - len(r))
+    con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    [tuple(r) + (None,) * (11 - len(r))
                      for r in state.get("pending", [])])
-    con.executemany("INSERT OR IGNORE INTO outbox VALUES (?,?,?,?,?,?,?)",
-                    state.get("outbox", []))
+    con.executemany("INSERT OR IGNORE INTO outbox VALUES (?,?,?,?,?,?,?,?)",
+                    [tuple(r) + (None,) * (8 - len(r)) for r in state.get("outbox", [])])
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
     con.commit()
@@ -1016,6 +1042,8 @@ def send_discord_ping(webhook, jobs, kind, mention="", omitted=0, enqueue=None):
         age = _rel_age(j.get("posted"))
         if age:
             parts.append(f"🕒 {age}")
+        if j.get("_freshness_note"):
+            parts.append(j["_freshness_note"])
         sal = (j.get("salary") or "").strip()
         if sal:
             parts.append(f"💰 {sal[:60]}")
@@ -1060,6 +1088,8 @@ def _feed_blocks(jobs, watch=None):
             age = _rel_age(j.get("posted"))
             if age:
                 line += f" · {age}"
+            if j.get("_freshness_note"):
+                line += " · " + j["_freshness_note"]
             sal = (j.get("salary") or "").strip()
             if sal:
                 line += f" · 💰 {sal[:40]}"
@@ -1169,11 +1199,8 @@ def _telegram_text(jobs):
 
 
 def deliver(sub, jobs, con):
-    """The feeds (🛠️ intern / 💼 full-time) receive EVERY matching job — they
-    are the complete archive, queued in `pending` and posted @silent.
-    Configured categories at watchlist companies also fire a ranked, capped
-    loud ping (rich card per job + optional mention). Overflow remains in the
-    feeds, preserving coverage without creating a notification firehose."""
+    """Queue only freshness-approved jobs; dashboard collection remains broad."""
+    jobs = [(b, j) for b, j in jobs if (j.get("_alert_expires_at") or 0) > time.time()]
     watch = sub.get("watch")
     ping_candidates = []
     ts = now()
@@ -1185,11 +1212,11 @@ def deliver(sub, jobs, con):
                 and cat in sub["ping_categories"]):
             ping_candidates.append((b, j))
         con.execute(
-            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (sub["name"], "intern" if cat == "intern" else "ft", ts,
              j.get("company") or b.replace("_", " "), j["title"],
              j["url"], j.get("location") or "", j.get("salary") or "",
-             j.get("posted")))
+             j.get("posted"), j["_alert_expires_at"], j.get("_freshness_note", "")))
 
     # Keep loud alerts scarce and useful. Early-career roles sort first, then
     # the freshest postings; every omitted match is still retained in the
@@ -1211,37 +1238,44 @@ def deliver(sub, jobs, con):
     for tier, kind in (("ping_intern", "internship"), ("ping_ft", "role")):
         if tiers[tier] and sub.get("discord_configured", True):
             route = "ping:intern" if tier == "ping_intern" else "ping:full_time"
+            expiry = min(j["_alert_expires_at"] for _, j in tiers[tier])
             send_discord_ping("", tiers[tier], kind, mention=sub["mention"], omitted=omitted,
-                enqueue=lambda payload, route=route: _enqueue(con, sub["name"], route, payload))
+                enqueue=lambda payload, route=route, expiry=expiry: _enqueue(con, sub["name"], route, payload, expiry))
             omitted = 0
     hot_all = tiers["ping_intern"] + tiers["ping_ft"]
     if sub["telegram_chat"] and hot_all:
         send_telegram(sub["telegram_chat"], "🎯 apply now\n\n" + _telegram_text(hot_all),
-            enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload))
+            enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload,
+                min(j["_alert_expires_at"] for _, j in hot_all)))
     return True
 
 
-def _enqueue(con, subscriber, route, payload):
+def _enqueue(con, subscriber, route, payload, expires_at=None):
     # Store channel references, never webhook URLs or bot tokens in portable state.
     encoded = json.dumps(payload, sort_keys=True)
     key = hashlib.sha256(f"{subscriber}|{route}|{encoded}".encode()).hexdigest()
-    con.execute("INSERT OR IGNORE INTO outbox(id, sub, route, payload, created_at) VALUES (?,?,?,?,?)",
-                (key, subscriber, route, encoded, now()))
+    con.execute("INSERT OR IGNORE INTO outbox(id, sub, route, payload, created_at, expires_at) VALUES (?,?,?,?,?,?)",
+                (key, subscriber, route, encoded, now(), expires_at))
 
 
 def flush_outbox(con, subs, checkpoint=None):
     """Acknowledge each message independently; retry failures across restarts."""
+    expire_notifications(con)
     con.commit()  # Collected IDs and their notification queues become durable together.
     if checkpoint:
         checkpoint()
     subscribers = {s["name"]: s for s in subs}
     blocked = set(con.execute("SELECT sub, route FROM outbox WHERE next_try > ?", (time.time(),)))
     deadline = time.monotonic() + 90
-    rows = con.execute("SELECT id, sub, route, payload, attempts FROM outbox WHERE next_try <= ? ORDER BY CASE WHEN route LIKE 'ping:%' THEN 0 ELSE 1 END, created_at, rowid LIMIT 100",
+    rows = con.execute("SELECT id, sub, route, payload, attempts, expires_at FROM outbox WHERE next_try <= ? ORDER BY CASE WHEN route LIKE 'ping:%' THEN 0 ELSE 1 END, created_at, rowid LIMIT 100",
                        (time.time(),)).fetchall()
-    for key, name, route, encoded, attempts in rows:
+    for key, name, route, encoded, attempts, expires_at in rows:
         if time.monotonic() >= deadline:
             break
+        if expires_at <= time.time():
+            con.execute("DELETE FROM outbox WHERE id=?", (key,))
+            con.commit()
+            continue
         sub = subscribers.get(name)
         if not sub or (name, route) in blocked:
             continue
@@ -1263,6 +1297,8 @@ def flush_outbox(con, subs, checkpoint=None):
         retry_after = 0
         def send():
             nonlocal retry_after
+            if time.time() >= expires_at:
+                raise ValueError("notification freshness window expired")
             response = requests.post(endpoint, json=payload, timeout=10)
             if response.status_code == 429:
                 retry_after = max(retry_after, _retry_delay(response, 60))
@@ -1287,38 +1323,44 @@ def flush_feeds(config, con, subs, force=False):
     """Send queued feed jobs as one quiet digest per stream once the oldest
     queued job is feed_flush_minutes old (or the queue is huge). Pings never
     wait — this only paces the browse-later material."""
-    flush_min = config.get("feed_flush_minutes", 180)
+    expire_notifications(con)
+    flush_min = config.get("feed_flush_minutes", 5)
     for sub in subs:
         rows = con.execute(
-            "SELECT tier, ts, company, title, url, location, salary, posted "
+            "SELECT tier, ts, company, title, url, location, salary, posted, expires_at, freshness_note "
             "FROM pending WHERE sub=?", (sub["name"],)).fetchall()
         if not rows:
             continue
         oldest = min(r[1] for r in rows)
         age_min = (datetime.now(timezone.utc)
                    - datetime.fromisoformat(oldest)).total_seconds() / 60
-        if not force and age_min < flush_min and len(rows) < 80:
+        expires_soon = min(r[8] for r in rows) <= time.time() + flush_min * 60
+        if not force and not expires_soon and age_min < flush_min and len(rows) < 80:
             continue
         by_tier = {"intern": [], "ft": []}
         seen = set()
-        for tier, ts, company, title, url, location, salary, posted in rows:
+        for tier, ts, company, title, url, location, salary, posted, expires_at, freshness_note in rows:
             key = (canon_url(url), company.casefold(), title.casefold())
             if key in seen:     # same job queued twice via near-identical rows
                 continue
             seen.add(key)
             by_tier.setdefault(tier, []).append(
                 ("", {"company": company, "title": title, "url": url,
-                      "location": location, "salary": salary, "posted": posted}))
+                      "location": location, "salary": salary, "posted": posted,
+                      "_alert_expires_at": expires_at, "_freshness_note": freshness_note}))
         for tier, route_tier, label, color in (
             ("intern", "intern", "🛠️ {n} new internship{s}", 0x5865F2),
             ("ft", "full_time", "💼 {n} new-grad / full-time role{s}", 0x95A5A6),
         ):
             if by_tier[tier] and sub.get("discord_configured", True):
+                expiry = min(j["_alert_expires_at"] for _, j in by_tier[tier])
                 send_discord_feed("", label, by_tier[tier], color, sub.get("watch"),
-                    enqueue=lambda payload, route_tier=route_tier: _enqueue(con, sub["name"], "feed:" + route_tier, payload))
+                    enqueue=lambda payload, route_tier=route_tier, expiry=expiry: _enqueue(con, sub["name"], "feed:" + route_tier, payload, expiry))
         if sub["telegram_chat"]:
-            send_telegram(sub["telegram_chat"], _telegram_text(by_tier["intern"] + by_tier["ft"]),
-                enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload))
+            everything = by_tier["intern"] + by_tier["ft"]
+            send_telegram(sub["telegram_chat"], _telegram_text(everything),
+                enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload,
+                    min(j["_alert_expires_at"] for _, j in everything)))
         con.execute("DELETE FROM pending WHERE sub=?", (sub["name"],))
         log(f"  -> {sub['name']}: queued {len(rows)} feed job(s) for delivery")
 
@@ -1417,6 +1459,49 @@ def _fetch_board(name, cfg):
     return name, result
 
 
+DISCOVERY_ONLY_ATS = {"linkedin", "github_md", "github_listings"}
+
+
+def _collection_signature(cfg):
+    # Bump this version if collection semantics change. Expanded coverage must
+    # establish a fresh baseline before undated jobs can generate notifications.
+    return hashlib.sha256(("freshness-v1:" + json.dumps(cfg, sort_keys=True)).encode()).hexdigest()
+
+
+def alert_freshness(job, cfg, baseline, settings, timestamp):
+    """Return a conservative expiry and explanation, or a suppression reason."""
+    if cfg["ats"] in DISCOVERY_ONLY_ATS:
+        return None, "discovery source (original publication unverified)"
+    hours = settings.get("max_age_hours", 24)
+    max_age = hours * 3600
+    posted = _posted_epoch(job.get("posted"))
+    if posted is not None:
+        age = timestamp - posted
+        if age < 0:
+            return None, "future posting date"
+        if age >= max_age:
+            return None, "older than alert window"
+        return posted + max_age, ""
+    if job.get("posted") not in (None, ""):
+        return None, "invalid posting date"
+    if (baseline and baseline.get("signature") == _collection_signature(cfg)
+            and 0 <= timestamp - baseline.get("checked_at", 0)
+            < min(max_age, settings.get("observation_max_gap_hours", 6) * 3600)):
+        return baseline["checked_at"] + max_age, "New on company board · original posting date unavailable"
+    return None, "no recent comparable company-board baseline"
+
+
+def expire_notifications(con):
+    """Legacy queued payloads have no freshness evidence: retire them too."""
+    count = 0
+    for table in ("pending", "outbox"):
+        count += con.execute(f"DELETE FROM {table} WHERE expires_at IS NULL OR expires_at <= ?",
+                             (time.time(),)).rowcount
+    if count:
+        log(f"  freshness: retired {count} expired or unverified queued notification(s)")
+    return count
+
+
 def _record_failure(con, name, cfg, failures, error, broke, retry_after=0, backoff=True):
     failures += 1
     delay = max(retry_after, min(21600, max(60, cfg.get("min_interval", 0)) * (2 ** min(failures - 1, 8) if backoff else 1)))
@@ -1435,6 +1520,9 @@ def cycle(config, con):
                   if not k.startswith("_") and not v.get("disabled")}
     subs = load_subscribers(config.get("filters", {}))
     new_by_board = {}
+    freshness_settings = config.get("alert_freshness", {})
+    freshness_suppressed = 0
+    expire_notifications(con)
     broke = []
     ok_count = fail_count = skipped = 0
 
@@ -1455,6 +1543,11 @@ def cycle(config, con):
         completed = [(futs[fut], fut) for fut in as_completed(futs)]
         for name, fut in completed:
             seeded, failures, _ = board_row(con, name)
+            baseline_key = "freshness_baseline:" + name
+            saved = con.execute("SELECT v FROM kv WHERE k=?", (baseline_key,)).fetchone()
+            baseline = json.loads(saved[0]) if saved else None
+            if failures:
+                baseline = None
             con.execute("UPDATE boards SET last_poll=? WHERE board=?",
                         (time.time(), name))
             try:
@@ -1464,6 +1557,7 @@ def cycle(config, con):
                 _record_failure(con, name, due[name], failures,
                                 f"{type(e).__name__}: {e}", broke, retry_after)
                 fail_count += 1
+                con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
                 continue
 
             known = known_ids(con, name)
@@ -1472,6 +1566,8 @@ def cycle(config, con):
                 warnings.append(f"returned 0 jobs with {len(known)} known; read ignored")
             con.execute("UPDATE boards SET last_count=? WHERE board=?", (len(jobs), name))
             if warnings:
+                baseline = None
+                con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
                 _record_failure(con, name, due[name], failures, "; ".join(dict.fromkeys(warnings)), broke, backoff=not bool(jobs))
                 fail_count += 1
                 if not jobs:
@@ -1482,6 +1578,13 @@ def cycle(config, con):
                             (now(), name))
 
             fresh = [j for j in jobs if j["id"] and j["id"] not in known]
+            for j in fresh:
+                expiry, note = alert_freshness(j, due[name], baseline, freshness_settings, time.time())
+                j["_alert_expires_at"] = expiry
+                j["_freshness_note"] = note
+            if not warnings:
+                con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (baseline_key, json.dumps({
+                    "signature": _collection_signature(due[name]), "checked_at": t0})))
             ts = now()
             con.executemany(
                 """INSERT INTO jobs
@@ -1497,7 +1600,7 @@ def cycle(config, con):
                    VALUES (?,?,?,?,?)
                    ON CONFLICT(board, job_id) DO UPDATE SET
                      company=excluded.company, salary=excluded.salary,
-                     posted=COALESCE(excluded.posted, job_details.posted)""",
+                     posted=excluded.posted""",
                 [(name, j["id"], j.get("company") or name.replace("_", " "),
                   j.get("salary") or "", _posted_epoch(j.get("posted")))
                  for j in jobs])
@@ -1521,6 +1624,9 @@ def cycle(config, con):
         keep = []
         for j in jobs:
             total_new += 1
+            if not j.get("_alert_expires_at") or j["_alert_expires_at"] <= time.time():
+                freshness_suppressed += 1
+                continue
             if excl_co and excl_co.search(j.get("company") or ""):
                 agencies += 1       # staffing-agency spam: drop, don't alert
                 continue
@@ -1554,8 +1660,8 @@ def cycle(config, con):
             delivered += len(mine)
             log(f"  -> {sub['name']}: {len(mine)} job(s)")
 
-    # mark every gated job as alerted (even if no subscriber matched, so a
-    # later echo from another source can't ping something already evaluated)
+    # Only freshness-qualified jobs enter dedupe memory. A discovery-only
+    # echo must not suppress a later verified alert from a company board.
     ts = now()
     for board, jobs in gated.items():
         for j in jobs:
@@ -1592,7 +1698,7 @@ def cycle(config, con):
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
                 (f"-{RECENT_DAYS} days",))
-    # Unsent notifications are retained until acknowledged, never age-pruned.
+    # Retry only while the application opportunity still meets the freshness window.
     con.execute("DELETE FROM sends WHERE ts < datetime('now', '-90 days')")
     duration = time.time() - t0
     con.execute(
@@ -1605,7 +1711,8 @@ def cycle(config, con):
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
         f"{total_new} new, {deduped} cross-source dupes, {agencies} agency-spam, "
-        f"{delivered} deliveries | {duration:.1f}s")
+        f"{freshness_suppressed} old/unverified (dashboard only), "
+        f"{delivered} queued matches | {duration:.1f}s")
 
     hc = os.environ.get("HEALTHCHECK_URL", config.get("healthcheck_url", ""))
     if hc and (ok_count > 0):
@@ -1624,6 +1731,12 @@ def cmd_check(config):
     except re.error as e:
         print(f"✗ global filters: bad regex: {e}")
         errs += 1
+    freshness = config.get("alert_freshness", {})
+    for field in ("max_age_hours", "observation_max_gap_hours"):
+        value = freshness.get(field, 24 if field == "max_age_hours" else 6)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            print(f"✗ alert_freshness {field}: must be a positive finite number")
+            errs += 1
     profile = config.get("profile", {})
     for section in ("track_weights", "seniority_weights", "location_weights",
                     "company_type_weights", "year_weights", "skills",
@@ -1776,9 +1889,12 @@ def cmd_test(config, who):
                   "location": "Seattle, WA", "url": "https://example.com/6"}),
     ]
     con = db_open()
+    for _, job in fake:
+        job["_alert_expires_at"] = nowt + 3600
     ok = deliver(sub, fake, con)
     flush_feeds(config, con, [sub], force=True)   # demo digests immediately
-    print("sent ok" if ok else "send FAILED — check webhook/token")
+    flush_outbox(con, [sub])
+    print("examples queued; check outbox for any delivery failures" if ok else "send FAILED")
     con.commit()
 
 

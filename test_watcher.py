@@ -74,7 +74,7 @@ class PortableStateTests(unittest.TestCase):
 
         watcher.export_state(source)
         exported = json.loads(self.state_path.read_text())
-        self.assertEqual(3, exported["version"])
+        self.assertEqual(4, exported["version"])
 
         restored = self.database()
         watcher.import_state(restored)
@@ -157,6 +157,8 @@ class NotificationQualityTests(unittest.TestCase):
             }),
         ]
 
+        for _, job in jobs:
+            job["_alert_expires_at"] = time.time() + 3600
         self.assertTrue(watcher.deliver(sub, jobs, con))
 
         loud_jobs = [

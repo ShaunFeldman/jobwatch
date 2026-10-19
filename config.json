@@ -2,7 +2,11 @@
   "_readme": "Direct boards are paginated until exhausted. Incomplete reads remain visible in source health. Run python watcher.py --verify to check live coverage; --check validates configuration without network access. min_interval and failure backoff persist across Actions runs.",
 
   "interval_seconds": 45,
-  "feed_flush_minutes": 90,
+  "feed_flush_minutes": 5,
+  "alert_freshness": {
+    "max_age_hours": 24,
+    "observation_max_gap_hours": 6
+  },
   "digest_hour_utc": 13,
   "healthcheck_url": "",
 

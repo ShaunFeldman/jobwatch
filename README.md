@@ -6,7 +6,7 @@ ranking, fast alerts, and a lightweight application CRM.
 Jobwatch continuously checks **196 enabled sources** across company ATSs,
 startup boards, quant firms, banks, big tech, LinkedIn, and community listing
 repos. It indexes every role it sees, ranks each one against a transparent
-profile, and only interrupts you for the matches that meet your notification
+profile, and only interrupts you for fresh matches that meet your notification
 rules.
 
 The included profile is tuned for a 2027 candidate with strong backend,
@@ -100,17 +100,40 @@ or alert behavior:
 
 Cross-source deduplication prefers direct apply links and remembers alerts for
 90 days. It preserves job IDs in URL query parameters and keeps distinct
-requisitions even when their company and title match. LinkedIn may therefore
-show a duplicate when its public URL cannot be matched to a direct posting. Staffing-agency patterns are excluded before alert fanout.
+requisitions even when their company and title match. LinkedIn and community
+listings remain discovery sources in the dashboard; they do not independently
+trigger notifications because their original publication date is unverified. Staffing-agency patterns are excluded before alert fanout.
 
 ## Notifications
 
 Jobwatch uses a two-speed model:
 
-- **Apply now:** a ranked, capped, loud alert for matching categories at
-  watchlist companies.
-- **Complete feeds:** quiet digests containing every subscriber match,
-  including anything omitted from the loud cap.
+- **Apply now:** a ranked, capped, loud alert for fresh matches in configured
+  categories at watchlist companies.
+- **Fresh feeds:** quiet digests of all freshness-qualified subscriber matches,
+  including anything omitted from the loud cap. They become due after five
+  minutes and are sent on the next polling cycle.
+
+A job must be newly discovered **and** pass the freshness gate:
+
+- Company-reported posting date within the last **24 hours**. Greenhouse uses
+  `first_published`; edit timestamps are not accepted as publication evidence.
+- If the company supplies no posting date, the job must be absent from a
+  previous complete read of the same board configuration less than **six hours**
+  ago. These alerts say **New on company board · original posting date unavailable**.
+- Known old dates never fall back to first-seen time. First runs, coverage
+  changes, outages, and partial reads cannot certify undated backfills as new.
+- LinkedIn and community-listing sources are **dashboard only**, even when they
+  claim a recent date. This avoids treating a repost or a newly added list entry
+  as a newly published company opening. Companies without a monitored direct
+  source therefore remain searchable but do not currently generate alerts.
+
+Older and unverified jobs stay searchable. Alert freshness is configured in
+`config.json` under `alert_freshness.max_age_hours` (24) and
+`alert_freshness.observation_max_gap_hours` (6). Existing title, location,
+watchlist, and loud-alert cap rules still apply. Polling and provider outages
+mean delivery is not instantaneous; a company can also republish an opening
+under a new ID, so its reported date is not proof of a brand-new requisition.
 
 Recommended Discord channels are `#apply-now-intern`,
 `#apply-now-full-time`, `#internships`, and `#full-time`. Unset optional hooks
@@ -193,8 +216,13 @@ Markdown tables follow named columns and retain multiple apply links per row.
 Job notifications use a durable per-message outbox. Each Discord/Telegram
 message is acknowledged separately, so a failed loud alert is retried and a
 successful feed chunk is not resent just because another chunk failed. Missing
-secrets leave messages queued. Pending messages do not expire automatically.
-Portable state version 3 includes the outbox and source-health details, reads
+secrets leave messages queued only while their freshness window remains open.
+Expired pending jobs and outbox messages are discarded before sending, including
+on retry. A grouped message expires with its earliest job to avoid stale alerts.
+Legacy queues have no freshness evidence and are retired on upgrade; the job
+index and application history are kept.
+Portable state version 4 includes freshness deadlines, comparable-read baselines,
+the outbox, and source-health details, reads
 older state versions, and excludes webhook URLs, bot tokens, and application
 notes. The first successful read of a new source still seeds silently.
 

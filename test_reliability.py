@@ -20,7 +20,8 @@ def response(data, status=200, headers=None):
 
 def job(jid='1', **extra):
     return dict(id=jid, title='Software Engineer Intern', location='Toronto',
-                url=f'https://example.com/jobs/{jid}', company='Example', **extra)
+                url=f'https://example.com/jobs/{jid}', company='Example',
+                _alert_expires_at=time.time() + 3600, **extra)
 
 
 def subscriber(name='test', **extra):
@@ -222,7 +223,7 @@ class DurableDeliveryTests(unittest.TestCase):
     @patch('watcher.requests.post')
     @patch('watcher.time.sleep')
     def test_delivery_rate_limit_persists_provider_cooldown(self, sleep, post):
-        watcher._enqueue(self.con, 'test', 'feed:intern', {'content': 'hello'})
+        watcher._enqueue(self.con, 'test', 'feed:intern', {'content': 'hello'}, time.time() + 3600)
         post.return_value = response({'retry_after': 600}, 429, {'Retry-After': '600'})
         before = time.time()
         watcher.flush_outbox(self.con, [subscriber()])
@@ -266,10 +267,10 @@ class DurableDeliveryTests(unittest.TestCase):
             fetch.assert_not_called()
 
     def test_per_subscriber_source_selection_precedes_cross_source_dedupe(self):
-        boards = {'direct': {'ats': 'greenhouse'}, 'repo': {'ats': 'github_listings'}}
+        boards = {'direct': {'ats': 'greenhouse'}, 'other_direct': {'ats': 'ashby'}}
         for board in boards:
             self.con.execute('INSERT INTO boards(board,seeded) VALUES (?,1)', (board,))
-        self.run_cycle(watcher.FetchResult([job()]), boards, [subscriber(companies={'repo'})])
+        self.run_cycle(watcher.FetchResult([job(posted=time.time()-60)]), boards, [subscriber(companies={'other_direct'})])
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
 
     def test_first_run_is_silent(self):
