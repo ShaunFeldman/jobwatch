@@ -2,7 +2,7 @@
   "_readme": "Direct boards are paginated until exhausted. Incomplete reads remain visible in source health. Run python watcher.py --verify to check live coverage; --check validates configuration without network access. min_interval and failure backoff persist across Actions runs.",
 
   "interval_seconds": 45,
-  "feed_flush_minutes": 5,
+  "feed_flush_minutes": 1,
   "alert_freshness": {
     "max_age_hours": 24,
     "observation_max_gap_hours": 6
@@ -67,7 +67,7 @@
                         "_note": "their own positions JSON — direct, includes salary + New Grad/Internship availability" },
     "worldquant":     { "ats": "greenhouse", "token": "worldquant" },
 
-    "_canadian_banks": "--- Workday boards; browse newest 300, filters trim. RBC is on Phenom (their own platform). ---",
+    "_canadian_banks": "Workday boards paginate all listings; RBC uses Phenom.",
     "rbc":            { "ats": "phenom", "host": "jobs.rbc.com", "query": "software", "min_interval": 900,
                         "url": "https://jobs.rbc.com/ca/en/job/{id}" },
     "rbc_early":      { "ats": "phenom", "host": "jobs.rbc.com", "query": "intern", "min_interval": 900,
@@ -95,7 +95,7 @@
     "amazon_newgrad": { "ats": "amazon_jobs", "query": "software development engineer", "min_interval": 300 },
     "microsoft":      { "ats": "microsoft",   "query": "software engineer intern", "min_interval": 300, "disabled": true,
                         "_note": "gcsservices.careers.microsoft.com serves a *.azureedge.net cert whose SAN does not cover the host, so every TLS verify fails (server-side misconfig, not a local network issue) — aggregator repos below cover Microsoft" },
-    "_workday_note":  "the *_early boards use tenant-specific facet ids (Intern / University / New College Grad worker subtypes) so they see EVERY early-career req server-side; the plain boards browse the 300 newest of everything as a safety net for new-grad-titled roles the facets miss. Find facet ids by POSTing to /wday/cxs/TENANT/SITE/jobs and reading the `facets` array in the response.",
+    "_workday_note": "Early-career facet boards complement complete unfiltered pagination. Partial reads are reported explicitly.",
     "nvidia":         { "ats": "workday", "host": "nvidia.wd5.myworkdayjobs.com", "tenant": "nvidia", "site": "NVIDIAExternalCareerSite", "min_interval": 600,
                         "facets": { "workerSubType": ["ab40a98049581037a3ada55b087049b7", "0c40f6bd1d8f10adf6dae42e46d44a17"] },
                         "_note": "facets = New College Graduate + Intern (Fixed Term)" },
@@ -110,14 +110,14 @@
                         "facets": { "workerSubType": ["cfba33fac07f49c9b6d3d53336c6a291"] } },
     "disney_early":   { "ats": "workday", "host": "disney.wd5.myworkdayjobs.com", "tenant": "disney", "site": "disneycareer", "min_interval": 600,
                         "facets": { "workerSubType": ["4f84d9e8a0970100aec0ae70150e0000"] } },
-    "salesforce":     {"ats": "workday", "host": "salesforce.wd12.myworkdayjobs.com", "tenant": "salesforce", "site": "External_Career_Site", "search": "", "min_interval": 3600},
+    "salesforce":     {"ats": "workday", "host": "salesforce.wd12.myworkdayjobs.com", "tenant": "salesforce", "site": "External_Career_Site", "search": "", "min_interval": 3600, "page_delay_seconds": 1.0},
     "adobe":          { "ats": "workday", "host": "adobe.wd5.myworkdayjobs.com", "tenant": "adobe", "site": "external_experienced", "search": "", "min_interval": 1800 },
     "capital_one":    { "ats": "workday", "host": "capitalone.wd12.myworkdayjobs.com", "tenant": "capitalone", "site": "Capital_One", "search": "", "min_interval": 1800 },
     "intel":          { "ats": "workday", "host": "intel.wd1.myworkdayjobs.com", "tenant": "intel", "site": "External", "search": "", "min_interval": 1800 },
     "paypal":         { "ats": "workday", "host": "paypal.wd1.myworkdayjobs.com", "tenant": "paypal", "site": "jobs", "search": "", "min_interval": 1800 },
     "mastercard":     { "ats": "workday", "host": "mastercard.wd1.myworkdayjobs.com", "tenant": "mastercard", "site": "CorporateCareers", "search": "", "min_interval": 1800 },
     "disney":         { "ats": "workday", "host": "disney.wd5.myworkdayjobs.com", "tenant": "disney", "site": "disneycareer", "search": "", "min_interval": 1800 },
-    "netflix":        { "ats": "eightfold", "host": "explore.jobs.netflix.net", "domain": "netflix.com", "min_interval": 600 },
+    "netflix":        { "ats": "eightfold", "host": "explore.jobs.netflix.net", "domain": "netflix.com", "min_interval": 180, "page_delay_seconds": 1.0 },
 
     "_ai_and_startups": "----------------------------------------",
     "anthropic":      { "ats": "greenhouse", "token": "anthropic" },

@@ -74,7 +74,7 @@ class PortableStateTests(unittest.TestCase):
 
         watcher.export_state(source)
         exported = json.loads(self.state_path.read_text())
-        self.assertEqual(4, exported["version"])
+        self.assertEqual(5, exported["version"])
 
         restored = self.database()
         watcher.import_state(restored)
@@ -107,7 +107,7 @@ class NotificationQualityTests(unittest.TestCase):
         self.assertEqual("🔥 3h ago", watcher._rel_age(posted))
 
     @patch("watcher.send_discord_ping", return_value=True)
-    def test_loud_alert_cap_keeps_every_job_in_quiet_feed(self, send_ping):
+    def test_important_jobs_are_not_truncated_and_all_reach_quiet_feed(self, send_ping):
         with patch.object(watcher, "DB_PATH", ":memory:"):
             con = watcher.db_open()
 
@@ -167,19 +167,15 @@ class NotificationQualityTests(unittest.TestCase):
             for _, job in call.args[1]
         ]
         self.assertEqual(
-            ["1", "2"],
+            ["1", "2", "3"],
             sorted(job["id"] for job in loud_jobs),
         )
         self.assertEqual(
             4,
             con.execute("SELECT COUNT(*) FROM pending").fetchone()[0],
         )
-        self.assertTrue(
-            any(
-                call.kwargs["omitted"] == 1
-                for call in send_ping.call_args_list
-            )
-        )
+        self.assertTrue(all(call.kwargs.get("omitted", 0) == 0
+                            for call in send_ping.call_args_list))
 
 
 if __name__ == "__main__":

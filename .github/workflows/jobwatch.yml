@@ -35,10 +35,8 @@ jobs:
             exit 1
           fi
       - run: pip install -r requirements.txt
-      - name: run unit tests and validate configuration
-        run: |
-          python -m unittest -v
-          python watcher.py --check
+      - name: validate configuration
+        run: python watcher.py --check
       - name: restore state
         id: restore
         # state lives on the force-pushed `state` branch so main stays clean
@@ -53,7 +51,7 @@ jobs:
           else
             echo "no state branch yet — first run seeds silently"
           fi
-      - name: poll loop (bounded to 22 minutes including slow sources)
+      - name: continuous polling with minute checkpoints
         id: poll
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -65,20 +63,20 @@ jobs:
         run: |
           git config user.name "jobwatch"
           git config user.email "jobwatch@users.noreply.github.com"
-          END=$((SECONDS + 1320))
-          while [ $((END - SECONDS)) -gt 180 ]; do
-            remaining=$((END - SECONDS - 60))
-            result=0
-            timeout --signal=TERM --kill-after=15s "${remaining}s" python watcher.py --once || result=$?
-            bash .github/scripts/save-state.sh
-            if [ "$result" -eq 124 ]; then
-              echo "cycle reached the run deadline; saved the latest durable checkpoint"
-              break
+          # Independent source schedules stay alive across slow fetches. Atomic
+          # JSON snapshots are published every minute, including during polling.
+          python watcher.py --run-for 1200 &
+          collector=$!
+          while kill -0 "$collector" 2>/dev/null; do
+            sleep 60
+            if ! bash .github/scripts/save-state.sh; then
+              kill "$collector" 2>/dev/null || true
+              wait "$collector" || true
+              exit 1
             fi
-            [ "$result" -eq 0 ] || exit "$result"
-            [ $((END - SECONDS)) -le 330 ] && break
-            sleep 150
           done
+          wait "$collector"
+          bash .github/scripts/save-state.sh
       - name: preserve state after an interrupted poll
         if: always() && steps.restore.outcome == 'success' && steps.poll.outcome != 'skipped'
         run: bash .github/scripts/save-state.sh

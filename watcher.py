@@ -33,7 +33,7 @@ import re
 import sqlite3
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -148,6 +148,7 @@ class FetchResult(list):
     def __init__(self, rows=(), warnings=()):
         super().__init__(rows)
         self.warnings = list(warnings)
+        self.retry_after = 0
 
 
 def _retry_delay(response, default=2):
@@ -187,6 +188,8 @@ def _pages(fetch, identity, cfg):
     deadline = time.monotonic() + cfg.get("fetch_budget_seconds", 180)
     for _ in range(cfg.get("max_pages", 1000)):
         try:
+            if offset and cfg.get("page_delay_seconds"):
+                time.sleep(cfg["page_delay_seconds"])
             rows, reported = fetch(offset)
             if not isinstance(rows, list):
                 raise ValueError("expected a job list")
@@ -212,6 +215,8 @@ def _pages(fetch, identity, cfg):
                 out.warnings.append(f"pagination repeated at offset {offset}")
                 return out
             if total is not None and offset >= total:
+                if len(seen) < total:
+                    out.warnings.append(f"only {len(seen)} unique IDs for {total} reported postings")
                 return out
             if time.monotonic() >= deadline:
                 out.warnings.append(f"fetch time budget reached after {offset} postings")
@@ -219,6 +224,7 @@ def _pages(fetch, identity, cfg):
         except Exception as exc:
             if not out:
                 raise
+            out.retry_after = _retry_delay(getattr(exc, "response", None), 60)
             out.warnings.append(f"page at offset {offset}: {type(exc).__name__}: {exc}")
             return out
     out.warnings.append(f"page safety limit reached after {offset} postings")
@@ -226,20 +232,32 @@ def _pages(fetch, identity, cfg):
 
 
 def _mapped(rows, convert):
-    return FetchResult((convert(row) for row in rows), getattr(rows, "warnings", ()))
+    result = FetchResult(warnings=getattr(rows, "warnings", ()))
+    result.retry_after = getattr(rows, "retry_after", 0)
+    for row in rows:
+        try:
+            result.append(convert(row))
+        except (KeyError, TypeError, ValueError) as exc:
+            result.warnings.append(f"invalid posting: {type(exc).__name__}: {exc}")
+    return result
 
 
 def fetch_greenhouse(cfg):
     url = f"https://boards-api.greenhouse.io/v1/boards/{cfg['token']}/jobs?content=false"
     r = _source_request("get", url, headers={"User-Agent": UA}, timeout=TIMEOUT)
     r.raise_for_status()
-    return [{
+    data = r.json()
+    rows = FetchResult(data["jobs"])
+    total = (data.get("meta") or {}).get("total")
+    if total is not None and len(rows) != int(total):
+        rows.warnings.append(f"received {len(rows)} of {total} reported postings")
+    return _mapped(rows, lambda j: {
         "id": str(j["id"]),
         "title": j.get("title", ""),
         "location": (j.get("location") or {}).get("name", ""),
         "url": j.get("absolute_url", ""),
         "posted": _iso_epoch(j.get("first_published")),
-    } for j in r.json()["jobs"]]
+    })
 
 
 def fetch_lever(cfg):
@@ -635,7 +653,9 @@ def fetch_eightfold(cfg):
     rows = _pages(page, lambda j: j.get("id"), cfg)
     return _mapped(rows, lambda j: {
         "id": str(j["id"]), "title": j.get("name", ""),
-        "location": j.get("location", "") or "",
+        "location": " | ".join(dict.fromkeys(filter(None,
+            [j.get("location")] + j.get("locations", [])
+            + (["Remote"] if j.get("work_location_option") == "remote" else [])))),
         "url": j.get("canonicalPositionUrl") or f"https://{cfg['host']}/careers/job/{j['id']}",
     })
 
@@ -717,7 +737,16 @@ def db_open(path=None):
     con.execute("CREATE INDEX IF NOT EXISTS details_posted ON job_details(posted)")
     con.execute("CREATE INDEX IF NOT EXISTS applications_status ON applications(status)")
 
+    if not con.execute("SELECT 1 FROM kv WHERE k='full_feed_retention_v5'").fetchone():
+        retain_full_feeds(con)
+        con.execute("INSERT INTO kv VALUES ('full_feed_retention_v5','1')")
+        con.commit()
     return con
+
+
+def retain_full_feeds(con):
+    con.execute("UPDATE pending SET expires_at=0 WHERE expires_at IS NOT NULL")
+    con.execute("UPDATE outbox SET expires_at=0 WHERE route LIKE 'feed:%' AND expires_at IS NOT NULL")
 
 
 def known_ids(con, board):
@@ -741,7 +770,7 @@ def export_state(con):
     older state files did) made every imported row look newly seen, so the
     90-day pruning window could never expire and state.json grew forever.
     """
-    state = {"version": 4, "boards": {}, "alerted": []}
+    state = {"version": 5, "boards": {}, "alerted": []}
     for board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll in con.execute(
             "SELECT board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll FROM boards"):
         jobs = [list(r) for r in con.execute(
@@ -803,6 +832,8 @@ def import_state(con):
                     [tuple(r) + (None,) * (8 - len(r)) for r in state.get("outbox", [])])
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
+    if state.get("version", 1) < 5:
+        retain_full_feeds(con)
     con.commit()
     log(f"imported state.json: {len(state.get('boards', {}))} boards")
 
@@ -924,7 +955,6 @@ def load_subscribers(global_filters):
             "mention": s.get("discord_mention", ""),
             "ping_categories": set(s.get(
                 "ping_categories", ["intern", "new_grad", "other"])),
-            "max_ping_jobs": max(0, int(s.get("max_ping_jobs", 10))),
             "ops": bool(s.get("ops")),
             "digest": bool(s.get("digest")),
             "discord_configured": bool(s.get("discord_webhook") or any((s.get("ping_webhooks") or {}).values()) or any((s.get("feeds") or {}).values())),
@@ -939,8 +969,8 @@ def load_subscribers(global_filters):
 
 
 # ================================================================ delivery
-def _post_with_retry(fn, what):
-    for attempt in range(SEND_RETRIES):
+def _post_with_retry(fn, what, attempts=SEND_RETRIES):
+    for attempt in range(attempts):
         try:
             r = fn()
             if r.status_code == 429:
@@ -949,14 +979,14 @@ def _post_with_retry(fn, what):
                                  r.json().get("retry_after", 2))
                 except Exception:
                     wait = 2.0
-                if wait > 15:
+                if wait > 15 or attempt == attempts - 1:
                     return False
                 time.sleep(max(0, wait))
                 continue
             r.raise_for_status()
             return True
         except Exception as e:
-            if attempt == SEND_RETRIES - 1:
+            if attempt == attempts - 1:
                 log(f"! send failed ({what}): {type(e).__name__}")
                 return False
             time.sleep(2 ** attempt)
@@ -1022,7 +1052,9 @@ def send_discord_ping(webhook, jobs, kind, mention="", omitted=0, enqueue=None):
         age = _rel_age(j.get("posted"))
         if age:
             line += f" · {age}"
-        lines.append(line[:170])
+        if j.get("_freshness_note"):
+            line += " · " + j["_freshness_note"]
+        lines.append(line[:300])
     shown = lines[:5]
     if len(lines) > 5:
         shown.append(f"…and {len(lines) - 5} more")
@@ -1057,7 +1089,9 @@ def send_discord_ping(webhook, jobs, kind, mention="", omitted=0, enqueue=None):
         })
     ok = True
     for i in range(0, len(embeds), 10):     # 10 embeds max per message
-        payload = {"embeds": embeds[i:i + 10]}
+        payload = {"embeds": embeds[i:i + 10], "allowed_mentions": {"parse": [],
+            "users": re.findall(r"<@!?(\d+)>", mention),
+            "roles": re.findall(r"<@&(\d+)>", mention)}}
         if i == 0:
             payload["content"] = header
         if enqueue:
@@ -1137,7 +1171,7 @@ def send_discord_feed(webhook, label, jobs, color, watch=None, enqueue=None):
         payload = {"embeds": [{"title": title, "description": desc,
                                "color": color, "timestamp": ts,
                                "footer": {"text": "jobwatch · quiet digest"}}],
-                   "flags": 4096}
+                   "flags": 4096, "allowed_mentions": {"parse": []}}
         if enqueue:
             enqueue(payload)
         else:
@@ -1198,56 +1232,46 @@ def _telegram_text(jobs):
     return "\n\n".join(parts)
 
 
+def _route_seen(con, sub, route, job):
+    # Legacy global keys mean a pre-upgrade alert already went to both tiers.
+    if already_alerted(con, job):
+        return True
+    return any(con.execute("SELECT 1 FROM alerted WHERE key=?",
+               (f"route:{sub}:{route}:{key}",)).fetchone() for key in dedupe_keys(job))
+
+
+def _mark_route(con, sub, route, job):
+    con.executemany("INSERT OR IGNORE INTO alerted VALUES (?,?)",
+        [(f"route:{sub}:{route}:{key}", now()) for key in dedupe_keys(job)])
+
+
 def deliver(sub, jobs, con):
-    """Queue only freshness-approved jobs; dashboard collection remains broad."""
-    jobs = [(b, j) for b, j in jobs if (j.get("_alert_expires_at") or 0) > time.time()]
-    watch = sub.get("watch")
-    ping_candidates = []
-    ts = now()
-    for b, j in jobs:
-        cat = _category(j["title"])
-        # watchlist matches company only — titles like 'Salesforce Developer
-        # Intern' at a consultancy must not count
-        if (watch and watch.search(j.get("company") or b)
-                and cat in sub["ping_categories"]):
-            ping_candidates.append((b, j))
-        con.execute(
-            "INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (sub["name"], "intern" if cat == "intern" else "ft", ts,
-             j.get("company") or b.replace("_", " "), j["title"],
-             j["url"], j.get("location") or "", j.get("salary") or "",
-             j.get("posted"), j["_alert_expires_at"], j.get("_freshness_note", "")))
-
-    # Keep loud alerts scarce and useful. Early-career roles sort first, then
-    # the freshest postings; every omitted match is still retained in the
-    # complete quiet feeds above.
-    priority = {"intern": 0, "new_grad": 1, "other": 2}
-    ping_candidates.sort(key=lambda pair: (
-        priority[_category(pair[1]["title"])],
-        -(_posted_epoch(pair[1].get("posted")) or 0),
-        (pair[1].get("company") or pair[0]).casefold(),
-        pair[1]["title"].casefold()))
-    limit = sub["max_ping_jobs"]
-    selected = ping_candidates[:limit]
-    omitted = len(ping_candidates) - len(selected)
-    tiers = {"ping_intern": [], "ping_ft": []}
-    for pair in selected:
-        cat = _category(pair[1]["title"])
-        tiers["ping_intern" if cat == "intern" else "ping_ft"].append(pair)
-
-    for tier, kind in (("ping_intern", "internship"), ("ping_ft", "role")):
-        if tiers[tier] and sub.get("discord_configured", True):
-            route = "ping:intern" if tier == "ping_intern" else "ping:full_time"
-            expiry = min(j["_alert_expires_at"] for _, j in tiers[tier])
-            send_discord_ping("", tiers[tier], kind, mention=sub["mention"], omitted=omitted,
-                enqueue=lambda payload, route=route, expiry=expiry: _enqueue(con, sub["name"], route, payload, expiry))
-            omitted = 0
-    hot_all = tiers["ping_intern"] + tiers["ping_ft"]
-    if sub["telegram_chat"] and hot_all:
-        send_telegram(sub["telegram_chat"], "🎯 apply now\n\n" + _telegram_text(hot_all),
-            enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload,
-                min(j["_alert_expires_at"] for _, j in hot_all)))
-    return True
+    """Queue each eligible channel independently, atomically with its dedupe keys."""
+    queued = 0
+    for board, job in jobs:
+        cat = _category(job["title"])
+        tier = "intern" if cat == "intern" else "full_time"
+        feed_route = f"feed:{tier}"
+        if not _route_seen(con, sub["name"], feed_route, job):
+            con.execute("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (sub["name"], "intern" if cat == "intern" else "ft", now(),
+                 job.get("company") or board.replace("_", " "), job["title"], job["url"],
+                 job.get("location") or "", job.get("salary") or "", job.get("posted"),
+                 0, job.get("_freshness_note", "")))  # 0 = durable, no freshness expiry
+            _mark_route(con, sub["name"], feed_route, job)
+            queued += 1
+        expiry = job.get("_alert_expires_at")
+        ping_route = f"ping:{tier}"
+        if (expiry and expiry > time.time() and sub.get("watch")
+                and sub["watch"].search(job.get("company") or board)
+                and cat in sub["ping_categories"]
+                and not _route_seen(con, sub["name"], ping_route, job)):
+            # A separate queue item per job gives each its own expiry; no truncation.
+            send_discord_ping("", [(board, job)], "internship" if cat == "intern" else "role",
+                mention=sub["mention"], enqueue=lambda payload: _enqueue(
+                    con, sub["name"], ping_route, payload, expiry))
+            _mark_route(con, sub["name"], ping_route, job)
+    return queued
 
 
 def _enqueue(con, subscriber, route, payload, expires_at=None):
@@ -1258,7 +1282,21 @@ def _enqueue(con, subscriber, route, payload, expires_at=None):
                 (key, subscriber, route, encoded, now(), expires_at))
 
 
-def flush_outbox(con, subs, checkpoint=None):
+_DELIVERY_READY = {}
+
+
+def _paced_post(endpoint, payload):
+    # Discord's own Retry-After remains authoritative; avoid preventable bursts.
+    delay = _DELIVERY_READY.get(endpoint, 0) - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+    try:
+        return requests.post(endpoint, json=payload, timeout=5)
+    finally:
+        _DELIVERY_READY[endpoint] = time.monotonic() + 0.45
+
+
+def flush_outbox(con, subs, checkpoint=None, budget_seconds=10, max_messages=8):
     """Acknowledge each message independently; retry failures across restarts."""
     expire_notifications(con)
     con.commit()  # Collected IDs and their notification queues become durable together.
@@ -1266,13 +1304,17 @@ def flush_outbox(con, subs, checkpoint=None):
         checkpoint()
     subscribers = {s["name"]: s for s in subs}
     blocked = set(con.execute("SELECT sub, route FROM outbox WHERE next_try > ?", (time.time(),)))
-    deadline = time.monotonic() + 90
-    rows = con.execute("SELECT id, sub, route, payload, attempts, expires_at FROM outbox WHERE next_try <= ? ORDER BY CASE WHEN route LIKE 'ping:%' THEN 0 ELSE 1 END, created_at, rowid LIMIT 100",
-                       (time.time(),)).fetchall()
+    deadline = time.monotonic() + budget_seconds
+    rows = con.execute("""SELECT id, sub, route, payload, attempts, expires_at FROM outbox AS ready
+        WHERE next_try <= ? AND NOT EXISTS (
+            SELECT 1 FROM outbox AS delayed WHERE delayed.sub=ready.sub
+            AND delayed.route=ready.route AND delayed.next_try > ?)
+        ORDER BY CASE WHEN route LIKE 'ping:%' THEN 0 ELSE 1 END, created_at, rowid LIMIT ?""",
+        (time.time(), time.time(), max_messages)).fetchall()
     for key, name, route, encoded, attempts, expires_at in rows:
         if time.monotonic() >= deadline:
             break
-        if expires_at <= time.time():
+        if expires_at and expires_at <= time.time():
             con.execute("DELETE FROM outbox WHERE id=?", (key,))
             con.commit()
             continue
@@ -1284,6 +1326,9 @@ def flush_outbox(con, subs, checkpoint=None):
             token = os.environ.get("TELEGRAM_BOT_TOKEN")
             if not token or not sub["telegram_chat"]:
                 blocked.add((name, route))
+                con.execute("UPDATE outbox SET next_try=? WHERE sub=? AND route=?",
+                            (time.time()+60, name, route))
+                con.commit()
                 continue
             endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
             payload["chat_id"] = sub["telegram_chat"]
@@ -1293,13 +1338,16 @@ def flush_outbox(con, subs, checkpoint=None):
             endpoint = mapping.get(tier) or sub["discord"]
             if not endpoint:
                 blocked.add((name, route))
+                con.execute("UPDATE outbox SET next_try=? WHERE sub=? AND route=?",
+                            (time.time()+60, name, route))
+                con.commit()
                 continue
         retry_after = 0
         def send():
             nonlocal retry_after
-            if time.time() >= expires_at:
+            if expires_at and time.time() >= expires_at:
                 raise ValueError("notification freshness window expired")
-            response = requests.post(endpoint, json=payload, timeout=10)
+            response = _paced_post(endpoint, payload)
             if response.status_code == 429:
                 retry_after = max(retry_after, _retry_delay(response, 60))
                 try:
@@ -1307,8 +1355,10 @@ def flush_outbox(con, subs, checkpoint=None):
                 except (TypeError, ValueError):
                     pass
             return response
-        ok = _post_with_retry(send, route)
+        ok = _post_with_retry(send, route, attempts=1)
         if ok:
+            created = con.execute("SELECT created_at FROM outbox WHERE id=?", (key,)).fetchone()[0]
+            log(f"delivered {route}: queued {max(0, time.time() - (_iso_epoch(created) or time.time())):.1f}s")
             con.execute("DELETE FROM outbox WHERE id=?", (key,))
         else:
             blocked.add((name, route))
@@ -1334,7 +1384,7 @@ def flush_feeds(config, con, subs, force=False):
         oldest = min(r[1] for r in rows)
         age_min = (datetime.now(timezone.utc)
                    - datetime.fromisoformat(oldest)).total_seconds() / 60
-        expires_soon = min(r[8] for r in rows) <= time.time() + flush_min * 60
+        expires_soon = any(r[8] and r[8] <= time.time() + flush_min * 60 for r in rows)
         if not force and not expires_soon and age_min < flush_min and len(rows) < 80:
             continue
         by_tier = {"intern": [], "ft": []}
@@ -1353,7 +1403,7 @@ def flush_feeds(config, con, subs, force=False):
             ("ft", "full_time", "💼 {n} new-grad / full-time role{s}", 0x95A5A6),
         ):
             if by_tier[tier] and sub.get("discord_configured", True):
-                expiry = min(j["_alert_expires_at"] for _, j in by_tier[tier])
+                expiry = 0
                 send_discord_feed("", label, by_tier[tier], color, sub.get("watch"),
                     enqueue=lambda payload, route_tier=route_tier, expiry=expiry: _enqueue(con, sub["name"], "feed:" + route_tier, payload, expiry))
         if sub["telegram_chat"]:
@@ -1442,6 +1492,7 @@ def _fetch_board(name, cfg):
                 raise
             time.sleep(0.75)
     result = FetchResult(warnings=getattr(jobs, "warnings", ()))
+    result.retry_after = getattr(jobs, "retry_after", 0)
     seen = set()
     for j in jobs:
         if (not isinstance(j, dict) or j.get("id") in (None, "", "None")
@@ -1465,13 +1516,11 @@ DISCOVERY_ONLY_ATS = {"linkedin", "github_md", "github_listings"}
 def _collection_signature(cfg):
     # Bump this version if collection semantics change. Expanded coverage must
     # establish a fresh baseline before undated jobs can generate notifications.
-    return hashlib.sha256(("freshness-v1:" + json.dumps(cfg, sort_keys=True)).encode()).hexdigest()
+    return hashlib.sha256(("freshness-v1:" + json.dumps({k: v for k, v in cfg.items() if k not in {"min_interval", "fetch_budget_seconds", "max_pages", "page_delay_seconds", "_note"}}, sort_keys=True)).encode()).hexdigest()
 
 
 def alert_freshness(job, cfg, baseline, settings, timestamp):
     """Return a conservative expiry and explanation, or a suppression reason."""
-    if cfg["ats"] in DISCOVERY_ONLY_ATS:
-        return None, "discovery source (original publication unverified)"
     hours = settings.get("max_age_hours", 24)
     max_age = hours * 3600
     posted = _posted_epoch(job.get("posted"))
@@ -1480,22 +1529,47 @@ def alert_freshness(job, cfg, baseline, settings, timestamp):
         if age < 0:
             return None, "future posting date"
         if age >= max_age:
-            return None, "older than alert window"
+            return None, f"Older posting — newly found · {int(age // 86400)} days old"
+        if cfg["ats"] in DISCOVERY_ONLY_ATS and not job.get("_official_posted"):
+            return timestamp + max_age, "Age unverified — may be older (discovery source)"
         return posted + max_age, ""
     if job.get("posted") not in (None, ""):
         return None, "invalid posting date"
-    if (baseline and baseline.get("signature") == _collection_signature(cfg)
+    if (cfg["ats"] not in DISCOVERY_ONLY_ATS and baseline and baseline.get("signature") == _collection_signature(cfg)
             and 0 <= timestamp - baseline.get("checked_at", 0)
             < min(max_age, settings.get("observation_max_gap_hours", 6) * 3600)):
         return baseline["checked_at"] + max_age, "New on company board · original posting date unavailable"
-    return None, "no recent comparable company-board baseline"
+    return timestamp + max_age, "Age unverified — may be older"
+
+
+def remember_publication(con, jobs, cfg, subs):
+    """Do not let a discovery repost override a known official publication date.
+
+    Keep evidence only for potentially relevant jobs, in portable state. Canonical
+    URL matching is intentionally conservative, not company/title guessing.
+    """
+    for job in jobs:
+        if not any(sub["filt"].ok(job) for sub in subs):
+            continue
+        key = "publication:" + canon_url(job["url"])
+        saved = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        previous = json.loads(saved[0]) if saved else None
+        posted = _posted_epoch(job.get("posted"))
+        if cfg["ats"] not in DISCOVERY_ONLY_ATS and posted and posted <= time.time():
+            if previous:
+                posted = min(posted, previous["posted"])
+            previous = {"posted": posted, "seen_at": time.time()}
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, json.dumps(previous)))
+        if previous:
+            job["posted"] = previous["posted"]
+            job["_official_posted"] = True
 
 
 def expire_notifications(con):
-    """Legacy queued payloads have no freshness evidence: retire them too."""
+    """0 means a retained discovery; NULL is an unverified legacy payload."""
     count = 0
     for table in ("pending", "outbox"):
-        count += con.execute(f"DELETE FROM {table} WHERE expires_at IS NULL OR expires_at <= ?",
+        count += con.execute(f"DELETE FROM {table} WHERE expires_at IS NULL OR (expires_at > 0 AND expires_at <= ?)",
                              (time.time(),)).rowcount
     if count:
         log(f"  freshness: retired {count} expired or unverified queued notification(s)")
@@ -1513,179 +1587,234 @@ def _record_failure(con, name, cfg, failures, error, broke, retry_after=0, backo
         log(f"! {name}: {error[:300]} (streak {failures}; retry in {int(delay)}s)")
 
 
-def cycle(config, con):
+def source_interval(cfg):
+    return cfg.get("min_interval", 1800 if cfg["ats"] in DISCOVERY_ONLY_ATS else 180)
+
+
+def source_health(cfg, state, timestamp=None):
+    timestamp = time.time() if timestamp is None else timestamp
+    if cfg.get("disabled"):
+        return "unsupported"
+    if not state.get("seeded"):
+        return "unseeded"
+    if state.get("failures"):
+        return "degraded"
+    last_ok = _iso_epoch(state.get("last_ok"))
+    if not last_ok or timestamp - last_ok > max(900, 3 * source_interval(cfg)):
+        return "stale"
+    return "healthy"
+
+
+def completed_boards(boards, con, run_seconds=0):
+    """Bound each lane and host; keep fast boards cycling while slow ones run.
+
+    SQLite remains exclusively on the consumer thread. None is a delivery tick.
+    One-shot mode checks every due board once, continuous mode checks its due time.
+    """
+    deadline = time.monotonic() + run_seconds
+    checked, running, hosts = set(), {}, set()
+    with ThreadPoolExecutor(max_workers=8) as direct, ThreadPoolExecutor(max_workers=2) as discovery:
+        while True:
+            accepting = not run_seconds or time.monotonic() < deadline
+            if accepting:
+                counts = {False: 0, True: 0}
+                for name, host, is_discovery in running.values():
+                    counts[is_discovery] += 1
+                ordered = sorted(boards.items(), key=lambda pair: board_row(con, pair[0])[2])
+                for name, cfg in ordered:
+                    if name in checked or any(v[0] == name for v in running.values()):
+                        continue
+                    _, _, last_poll = board_row(con, name)
+                    next_poll = con.execute("SELECT next_poll FROM boards WHERE board=?", (name,)).fetchone()[0]
+                    if time.time() < (next_poll or 0) or time.time() - last_poll < source_interval(cfg):
+                        continue
+                    is_discovery = cfg["ats"] in DISCOVERY_ONLY_ATS
+                    host = cfg.get("host") or ("linkedin.com" if cfg["ats"] == "linkedin" else name)
+                    if host in hosts or counts[is_discovery] >= (2 if is_discovery else 8):
+                        continue
+                    executor = discovery if is_discovery else direct
+                    future = executor.submit(fetch_board, name, cfg)
+                    running[future] = (name, host, is_discovery)
+                    hosts.add(host)
+                    counts[is_discovery] += 1
+            if not running:
+                if not run_seconds or not accepting:
+                    break
+                time.sleep(1)
+                yield None, None
+                continue
+            ready, _ = wait(running, timeout=1, return_when=FIRST_COMPLETED)
+            if not ready:
+                yield None, None
+            for future in sorted(ready, key=lambda f: running[f][2]):
+                name, host, _ = running.pop(future)
+                hosts.remove(host)
+                if not run_seconds:
+                    checked.add(name)
+                yield name, future
+
+
+def coverage_notices(config, con, subs):
+    trouble, recovered = [], []
+    columns = [r[1] for r in con.execute("PRAGMA table_info(boards)")]
+    for row in con.execute("SELECT * FROM boards").fetchall():
+        state = dict(zip(columns, row))
+        name = state["board"]
+        cfg = config["boards"].get(name)
+        if not cfg or cfg.get("disabled"):
+            continue
+        key = "coverage_notice:" + name
+        sent = con.execute("SELECT 1 FROM kv WHERE k=?", (key,)).fetchone()
+        health = source_health(cfg, state)
+        unhealthy = health == "stale" or (state["failures"] >= 3)
+        if unhealthy and not sent:
+            trouble.append(name)
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, now()))
+        elif sent and health == "healthy":
+            recovered.append(name)
+            con.execute("DELETE FROM kv WHERE k=?", (key,))
+    for names, title in ((trouble, "Coverage delayed"), (recovered, "Coverage recovered")):
+        if not names:
+            continue
+        payload = {"embeds": [{"title": title, "description": ", ".join(names)[:3500],
+                    "color": 0xE74C3C if names is trouble else 0x2ECC71}],
+                   "allowed_mentions": {"parse": []}, "flags": 4096}
+        for sub in subs:
+            if sub.get("ops"):
+                _enqueue(con, sub["name"], "feed:full_time", payload, 0)
+
+
+def cycle(config, con, run_seconds=0):
     t0 = time.time()
     started_at = now()
     all_boards = {k: v for k, v in config["boards"].items()
                   if not k.startswith("_") and not v.get("disabled")}
     subs = load_subscribers(config.get("filters", {}))
-    new_by_board = {}
     freshness_settings = config.get("alert_freshness", {})
-    freshness_suppressed = 0
     expire_notifications(con)
     broke = []
     ok_count = fail_count = skipped = 0
 
-    # respect per-board min_interval (big feeds like the 11MB listings repos
-    # only change every ~15 min; no point fetching them every 45s)
-    due = {}
-    for name, cfg in all_boards.items():
-        _, _, last_poll = board_row(con, name)
-        next_poll = con.execute("SELECT next_poll FROM boards WHERE board=?", (name,)).fetchone()[0]
-        if time.time() < (next_poll or 0) or time.time() - last_poll < cfg.get("min_interval", 0):
-            skipped += 1
+    total_new = deduped = agencies = delivered = 0
+    excl_co = Filt._c((config.get("filters") or {}).get("exclude_companies"))
+    due = all_boards
+    checkpoint_at = delivery_at = notice_at = 0.0
+    con.commit()
+    for name, fut in completed_boards(all_boards, con, run_seconds):
+        if time.monotonic() >= notice_at:
+            coverage_notices(config, con, subs)
+            notice_at = time.monotonic() + 60
+        if time.monotonic() >= delivery_at:
+            flush_feeds(config, con, subs)
+            flush_outbox(con, subs)
+            delivery_at = time.monotonic() + 1
+        if time.monotonic() >= checkpoint_at:
+            con.commit()
+            export_state(con)
+            checkpoint_at = time.monotonic() + 15
+        if name is None:
             continue
-        due[name] = cfg
+        seeded, failures, _ = board_row(con, name)
+        baseline_key = "freshness_baseline:" + name
+        saved = con.execute("SELECT v FROM kv WHERE k=?", (baseline_key,)).fetchone()
+        baseline = json.loads(saved[0]) if saved else None
+        signature_key = "collection_signature:" + name
+        old_signature = con.execute("SELECT v FROM kv WHERE k=?", (signature_key,)).fetchone()
+        changed = bool(old_signature and old_signature[0] != _collection_signature(due[name]))
+        if failures:
+            baseline = None
+        con.execute("UPDATE boards SET last_poll=? WHERE board=?",
+                    (time.time(), name))
+        try:
+            _, jobs = fut.result()
+        except Exception as e:
+            retry_after = _retry_delay(getattr(e, "response", None), 0)
+            _record_failure(con, name, due[name], failures,
+                            f"{type(e).__name__}: {e}", broke, retry_after)
+            fail_count += 1
+            con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
+            continue
 
-    con.commit()  # Do not hold a SQLite write lock while waiting on remote boards.
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = {ex.submit(fetch_board, n, c): n for n, c in due.items()}
-        completed = [(futs[fut], fut) for fut in as_completed(futs)]
-        for name, fut in completed:
-            seeded, failures, _ = board_row(con, name)
-            baseline_key = "freshness_baseline:" + name
-            saved = con.execute("SELECT v FROM kv WHERE k=?", (baseline_key,)).fetchone()
-            baseline = json.loads(saved[0]) if saved else None
-            if failures:
-                baseline = None
-            con.execute("UPDATE boards SET last_poll=? WHERE board=?",
-                        (time.time(), name))
-            try:
-                _, jobs = fut.result()
-            except Exception as e:
-                retry_after = _retry_delay(getattr(e, "response", None), 0)
-                _record_failure(con, name, due[name], failures,
-                                f"{type(e).__name__}: {e}", broke, retry_after)
-                fail_count += 1
-                con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
+        known = known_ids(con, name)
+        warnings = list(getattr(jobs, "warnings", ()))
+        if not jobs and len(known) >= ZERO_GUARD_MIN:
+            warnings.append(f"returned 0 jobs with {len(known)} known; read ignored")
+        con.execute("UPDATE boards SET last_count=? WHERE board=?", (len(jobs), name))
+        if warnings:
+            baseline = None
+            con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
+            _record_failure(con, name, due[name], failures, "; ".join(dict.fromkeys(warnings)), broke, retry_after=getattr(jobs, "retry_after", 0), backoff=not bool(jobs))
+            fail_count += 1
+            if not jobs:
                 continue
+        else:
+            ok_count += 1
+            con.execute("UPDATE boards SET failures=0, last_ok=?, last_error='', next_poll=0 WHERE board=?",
+                        (now(), name))
 
-            known = known_ids(con, name)
-            warnings = list(getattr(jobs, "warnings", ()))
-            if not jobs and len(known) >= ZERO_GUARD_MIN:
-                warnings.append(f"returned 0 jobs with {len(known)} known; read ignored")
-            con.execute("UPDATE boards SET last_count=? WHERE board=?", (len(jobs), name))
-            if warnings:
-                baseline = None
-                con.execute("DELETE FROM kv WHERE k=?", (baseline_key,))
-                _record_failure(con, name, due[name], failures, "; ".join(dict.fromkeys(warnings)), broke, backoff=not bool(jobs))
-                fail_count += 1
-                if not jobs:
-                    continue
-            else:
-                ok_count += 1
-                con.execute("UPDATE boards SET failures=0, last_ok=?, last_error='', next_poll=0 WHERE board=?",
-                            (now(), name))
-
-            fresh = [j for j in jobs if j["id"] and j["id"] not in known]
-            for j in fresh:
-                expiry, note = alert_freshness(j, due[name], baseline, freshness_settings, time.time())
-                j["_alert_expires_at"] = expiry
-                j["_freshness_note"] = note
-            if not warnings:
-                con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (baseline_key, json.dumps({
-                    "signature": _collection_signature(due[name]), "checked_at": t0})))
-            ts = now()
-            con.executemany(
-                """INSERT INTO jobs
-                   (board, job_id, title, location, url, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?,?)
-                   ON CONFLICT(board, job_id) DO UPDATE SET
-                     title=excluded.title, location=excluded.location,
-                     url=excluded.url, last_seen=excluded.last_seen""",
-                [(name, j["id"], j["title"], j["location"], j["url"], ts, ts)
-                 for j in jobs])
-            con.executemany(
-                """INSERT INTO job_details(board, job_id, company, salary, posted)
-                   VALUES (?,?,?,?,?)
-                   ON CONFLICT(board, job_id) DO UPDATE SET
-                     company=excluded.company, salary=excluded.salary,
-                     posted=excluded.posted""",
-                [(name, j["id"], j.get("company") or name.replace("_", " "),
-                  j.get("salary") or "", _posted_epoch(j.get("posted")))
-                 for j in jobs])
+        remember_publication(con, jobs, due[name], subs)
+        fresh = [j for j in jobs if j["id"] and j["id"] not in known]
+        for j in fresh:
+            expiry, note = alert_freshness(j, due[name], baseline, freshness_settings, time.time())
+            j["_alert_expires_at"] = expiry
+            j["_freshness_note"] = note
+        if not warnings:
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (baseline_key, json.dumps({
+                "signature": _collection_signature(due[name]), "checked_at": time.time()})))
+        ts = now()
+        con.executemany(
+            """INSERT INTO jobs
+               (board, job_id, title, location, url, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(board, job_id) DO UPDATE SET
+                 title=excluded.title, location=excluded.location,
+                 url=excluded.url, last_seen=excluded.last_seen""",
+            [(name, j["id"], j["title"], j["location"], j["url"], ts, ts)
+             for j in jobs])
+        con.executemany(
+            """INSERT INTO job_details(board, job_id, company, salary, posted)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(board, job_id) DO UPDATE SET
+                 company=excluded.company, salary=excluded.salary,
+                 posted=excluded.posted""",
+            [(name, j["id"], j.get("company") or name.replace("_", " "),
+              j.get("salary") or "", _posted_epoch(j.get("posted")))
+             for j in jobs])
+        if not warnings:
             con.execute("UPDATE boards SET seeded=1 WHERE board=?", (name,))
 
-            if not seeded:
-                log(f"  {name}: seeded {len(jobs)} postings silently")
-            elif fresh:
-                new_by_board[name] = fresh
+        if not warnings:
+            con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (signature_key, _collection_signature(due[name])))
+        if not seeded or changed:
+            log(f"  {name}: seeded {len(jobs)} postings silently")
+        elif fresh:
+            total_new += len(fresh)
+            keep = []
+            for job in fresh:
+                if excl_co and excl_co.search(job.get("company") or ""):
+                    agencies += 1
+                else:
+                    keep.append(job)
+            for sub in subs:
+                if "all" not in sub["companies"] and name not in sub["companies"]:
+                    continue
+                mine = [(name, job) for job in keep if sub["filt"].ok(job)]
+                queued = deliver(sub, mine, con)
+                delivered += queued
+                deduped += len(mine) - queued
+            for job in keep:
+                con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
+                    (now(), job.get("company") or name, job["title"], job["url"],
+                     job.get("location") or "", job.get("salary") or ""))
+        # Commit IDs, per-channel dedupe, and queues together before sending.
+        con.commit()
+        flush_feeds(config, con, subs)
+        flush_outbox(con, subs)
 
-    # ---- cross-source dedupe gate (same job via ATS + repo = one alert)
-    excl_co = Filt._c((config.get("filters") or {}).get("exclude_companies"))
-    total_new = deduped = agencies = 0
-    gated = {}
-    seen_keys = set()               # same job from two sources in ONE cycle
-    # direct boards first so when LinkedIn and the company's own ATS surface
-    # the same job in one cycle, the alert carries the direct apply link
-    ordered = sorted(new_by_board.items(),
-                     key=lambda kv: (all_boards[kv[0]]["ats"] in {"linkedin", "github_md", "github_listings"}, kv[0]))
-    for board, jobs in ordered:
-        keep = []
-        for j in jobs:
-            total_new += 1
-            if not j.get("_alert_expires_at") or j["_alert_expires_at"] <= time.time():
-                freshness_suppressed += 1
-                continue
-            if excl_co and excl_co.search(j.get("company") or ""):
-                agencies += 1       # staffing-agency spam: drop, don't alert
-                continue
-            ks = dedupe_keys(j)
-            if already_alerted(con, j):
-                deduped += 1
-                continue
-            if any(k in seen_keys for k in ks):
-                deduped += 1
-            seen_keys.update(ks)
-            keep.append(j)
-        if keep:
-            gated[board] = keep
 
-    # ---- fanout
-    delivered = 0
-    for sub in subs:
-        mine = []
-        subscriber_seen = set()
-        for board, jobs in gated.items():
-            if "all" not in sub["companies"] and board not in sub["companies"]:
-                continue
-            for j in jobs:
-                keys = dedupe_keys(j)
-                if sub["filt"].ok(j) and not any(k in subscriber_seen for k in keys):
-                    mine.append((board, j))
-                    subscriber_seen.update(keys)
-        if mine:
-            mine.sort(key=lambda t: (t[1].get("company", ""), t[1]["title"]))
-            deliver(sub, mine, con)
-            delivered += len(mine)
-            log(f"  -> {sub['name']}: {len(mine)} job(s)")
-
-    # Only freshness-qualified jobs enter dedupe memory. A discovery-only
-    # echo must not suppress a later verified alert from a company board.
-    ts = now()
-    for board, jobs in gated.items():
-        for j in jobs:
-            if already_alerted(con, j):
-                continue
-            mark_alerted(con, j)
-            con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
-                        (ts, j.get("company") or board.replace("_", " "),
-                         j["title"], j["url"], j.get("location") or "",
-                         j.get("salary") or ""))
-
+    coverage_notices(config, con, subs)
     flush_feeds(config, con, subs)
     flush_outbox(con, subs, checkpoint=lambda: export_state(con))
-
-    if broke:
-        detail = ", ".join(f"{n} ({err})" for n, err in broke)
-        for sub in subs:
-            if sub["ops"] and sub["discord"]:
-                send_discord_note(
-                    sub["discord"], "⚠️ jobwatch: board trouble",
-                    f"{len(broke)} board(s) failing 10 polls in a row: {detail}\n"
-                    f"Coverage is incomplete; recovered postings are still retained. "
-                    f"Check Sources or run `python watcher.py --verify`.",
-                    0xE74C3C)
 
     maybe_digest(config, con, subs)
 
@@ -1698,6 +1827,9 @@ def cycle(config, con):
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
                 (f"-{RECENT_DAYS} days",))
+    for key, value in con.execute("SELECT k,v FROM kv WHERE k LIKE 'publication:%'").fetchall():
+        if json.loads(value)["seen_at"] < time.time() - PRUNE_AFTER_DAYS * 86400:
+            con.execute("DELETE FROM kv WHERE k=?", (key,))
     # Retry only while the application opportunity still meets the freshness window.
     con.execute("DELETE FROM sends WHERE ts < datetime('now', '-90 days')")
     duration = time.time() - t0
@@ -1711,7 +1843,6 @@ def cycle(config, con):
 
     log(f"cycle: {ok_count} ok / {fail_count} fail / {skipped} not-due | "
         f"{total_new} new, {deduped} cross-source dupes, {agencies} agency-spam, "
-        f"{freshness_suppressed} old/unverified (dashboard only), "
         f"{delivered} queued matches | {duration:.1f}s")
 
     hc = os.environ.get("HEALTHCHECK_URL", config.get("healthcheck_url", ""))
@@ -1770,6 +1901,11 @@ def cmd_check(config):
             if field in board and (type(board[field]) is not int or board[field] < (0 if field == "min_interval" else 1)):
                 print(f"✗ board {name}: invalid {field}")
                 errs += 1
+        delay = board.get("page_delay_seconds", 0)
+        if (isinstance(delay, bool) or not isinstance(delay, (int, float))
+                or not math.isfinite(delay) or not 0 <= delay <= 10):
+            print(f"✗ board {name}: page_delay_seconds must be between 0 and 10")
+            errs += 1
         if board.get("ats") == "github_md":
             cols = board.get("cols", {})
             if (not {"company", "title", "url"} <= cols.keys()
@@ -1798,10 +1934,6 @@ def cmd_check(config):
             print(f"✗ subscriber {name}: unknown ping categories "
                   f"{', '.join(sorted(invalid))}")
             errs += 1
-        cap = s.get("max_ping_jobs", 10)
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
-            print(f"✗ subscriber {name}: max_ping_jobs must be a non-negative integer")
-            errs += 1
         if not s.get("discord_webhook") and not s.get("telegram_chat_id"):
             print(f"⚠ subscriber {name}: no delivery channel configured")
     n_boards = sum(1 for k in config["boards"] if not k.startswith("_"))
@@ -1813,6 +1945,10 @@ def cmd_verify(config):
     """Hit every enabled board once. The fastest way to fix wrong tokens."""
     boards = {k: v for k, v in config["boards"].items()
               if not k.startswith("_") and not v.get("disabled")}
+    disabled = {n: c for n, c in config["boards"].items()
+                if not n.startswith("_") and c.get("disabled")}
+    for name, cfg in disabled.items():
+        print(f"— {name:22} DISABLED / no direct monitoring: {cfg.get('_note', '')}")
     good = bad = 0
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = {ex.submit(fetch_board, n, c): n for n, c in boards.items()}
@@ -1830,10 +1966,10 @@ def cmd_verify(config):
                 print(f"✗ {name:22} {type(e).__name__}: {str(e)[:90]}")
                 bad += 1
     if bad:
-        print(f"\n{good} complete, {bad} failed or partial. Review the errors above; "
+        print(f"\n{good} complete, {bad} failed or partial, {len(disabled)} disabled. Review the errors above; "
               f"partial reads still retain recovered postings.")
     else:
-        print(f"\n{good} working, 0 broken — every enabled source is healthy.")
+        print(f"\n{good} complete reads, 0 failed/partial; {len(disabled)} configured sources disabled.")
     return 1 if bad else 0
 
 
@@ -1902,6 +2038,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--run-for", type=int, default=0, help="poll sources independently for this many seconds")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--list", metavar="BOARD")
@@ -1955,8 +2092,8 @@ def main():
 
     interval = config.get("interval_seconds", 45)
 
-    if args.once:
-        cycle(config, con)
+    if args.once or args.run_for:
+        cycle(config, con, run_seconds=args.run_for)
         export_state(con)      # portable state for Actions runners
         return
 
@@ -1964,7 +2101,7 @@ def main():
         f"boards every ~{interval}s")
     while True:
         try:
-            cycle(config, con)
+            cycle(config, con, run_seconds=1200)
         except KeyboardInterrupt:
             break
         except Exception as e:

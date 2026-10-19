@@ -234,7 +234,8 @@ class JobwatchService:
         enabled_names = {name for name, cfg in self.config.get("boards", {}).items()
                          if not name.startswith("_") and not cfg.get("disabled")}
         source_rows = [row for row in source_rows if row["board"] in enabled_names]
-        healthy = sum(1 for row in source_rows if row["seeded"] and not row["failures"])
+        healthy = sum(1 for row in source_rows if watcher.source_health(
+            self.config["boards"][row["board"]], dict(row)) == "healthy")
         seeded = sum(1 for row in source_rows if row["seeded"])
         recommendations = sorted(
             (j for j in jobs if j["status"] not in {"rejected", "archived"}),
@@ -274,6 +275,8 @@ class JobwatchService:
                 "label": name.replace("_", " ").title(),
                 "adapter": cfg.get("ats"),
                 "disabled": bool(cfg.get("disabled")),
+                "health": watcher.source_health(cfg, state),
+                "coverage_note": cfg.get("_note", ""),
                 "tags": sorted(self.tags.get(name, set())),
                 "seeded": bool(state.get("seeded")),
                 "last_ok": state.get("last_ok"),

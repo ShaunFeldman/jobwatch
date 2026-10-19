@@ -1,233 +1,127 @@
 # Jobwatch
 
-Your private career command center: broad job-market coverage, focused daily
-ranking, fast alerts, and a lightweight application CRM.
+A free job watcher for four Discord channels. It collects company postings,
+checks your role/location preferences, and sends important matches quickly.
 
-Jobwatch continuously checks **196 enabled sources** across company ATSs,
-startup boards, quant firms, banks, big tech, LinkedIn, and community listing
-repos. It indexes every role it sees, ranks each one against a transparent
-profile, and only interrupts you for fresh matches that meet your notification
-rules.
-
-The included profile is tuned for a 2027 candidate with strong backend,
-distributed-systems, quant, and ML experience. It prioritizes the U.S., then
-Canada, and gives extra weight to startups and trading firms. The product is
-not limited to those categories: software, quant, AI/data, hardware, product,
-design, finance, sales, operations, people/legal, and uncategorized roles are
-all searchable.
-
-## Start using it
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Populate the local database. The first run seeds alerts silently.
-python watcher.py --once
-
-# Open the daily dashboard at http://127.0.0.1:8787
-python watcher.py --serve
-```
-
-The dashboard opens automatically and provides:
-
-- a morning briefing with fresh, high-fit roles;
-- explainable 0–100 fit scores and score reasons;
-- full-text search and filters for role family, stage, location, startup,
-  freshness, and minimum fit;
-- a private application pipeline for saved, applied, interview, offer,
-  rejected, and archived roles;
-- notes, due dates, and next actions;
-- source health and the last polling-run status;
-- one-click CSV export.
-
-Application notes live only in `jobwatch.db`. They are never sent to Discord,
-included in `state.json`, or committed by the included workflow. The web server
-binds to loopback by default and has no authentication, so do not expose it to
-the public internet.
-
-## The daily workflow
-
-1. Open `python watcher.py --serve` and review **Worth your attention**.
-2. Use **Discover** to narrow the full market to SWE, quant, startups, or any
-   other family. A score is a sorting aid; every reason is visible.
-3. Save promising roles to **Pipeline**, record the next action, and move them
-   through the process.
-4. Let Discord or Telegram handle time-sensitive postings between reviews.
-5. Check **Sources** if coverage looks quiet; failures are visible instead of
-   silently shrinking the search.
-
-## How ranking works
-
-Collection and ranking are intentionally separate:
-
-- **Collection is broad.** Every returned posting is stored before subscriber
-  notification filters are applied.
-- **Ranking is personal.** `profile` in `config.json` assigns weights for role
-  family, career stage, geography, company type, and skills.
-- **Alerts stay scarce.** The existing filters in `subscribers.json` decide
-  what reaches quiet feeds and which watchlist matches create a loud ping.
-
-The default profile boosts internships/new-grad roles, U.S. and Canadian
-locations, software/quant/AI work, startup and quant companies, and skills such
-as Rust, distributed systems, databases, backend, cloud, Python, and C++.
-Senior roles and out-of-market locations rank lower but remain searchable.
-
-Edit the `profile` object to retune the dashboard without changing collection
-or alert behavior:
-
-```json
-{
-  "profile": {
-    "headline": "SWE, quant & startup roles · U.S. first, Canada too",
-    "track_weights": {"software": 18, "quant": 20, "data_ml": 15},
-    "location_weights": {"us": 12, "canada": 8, "remote": 9},
-    "skills": {"rust": 8, "distributed": 7, "python": 4}
-  }
-}
-```
-
-## Sources
-
-| Kind | Coverage |
+| Channel | Contents |
 |---|---|
-| Greenhouse, Lever, Ashby, SmartRecruiters | Direct company boards, including a large startup/AI/fintech set. Ashby includes compensation where published. |
-| Workday, Phenom, Eightfold | Banks, NVIDIA, Salesforce, Adobe, Capital One, Intel, PayPal, Mastercard, Disney, Netflix, and others. |
-| Bespoke adapters | Amazon, Jane Street, Hightouch, and Marqeta. The legacy Microsoft endpoint remains disabled; community feeds cover Microsoft. |
-| LinkedIn guest search | U.S. and Canadian searches without a login, newest first with a seven-day overlap. Page limits and query failures are reported. |
-| GitHub listing repos | Simplify, New Grad, internship, off-season, Canada, and salary-aware lists covering bespoke ATSs and long-tail companies. |
+| Important internships | Watchlist matches in the internship category; notifications enabled |
+| Important full-time | Watchlist matches in configured full-time categories; notifications enabled |
+| All internships | Every newly discovered matching internship; silent messages |
+| All full-time | Every newly discovered matching full-time job; silent messages |
 
-Cross-source deduplication prefers direct apply links and remembers alerts for
-90 days. It preserves job IDs in URL query parameters and keeps distinct
-requisitions even when their company and title match. LinkedIn and community
-listings remain discovery sources in the dashboard; they do not independently
-trigger notifications because their original publication date is unverified. Staffing-agency patterns are excluded before alert fanout.
+The existing `ping_categories` remain `intern` and `new_grad`: a generic role
+that passes your filters can still appear in a full feed without an important
+ping. Location, role, and company preferences live in `subscribers.json` and
+`config.json`. Nothing is submitted to employers automatically.
 
-## Notifications
+## Freshness and completeness
 
-Jobwatch uses a two-speed model:
+- Official postings published within 24 hours can ping. Edit dates do not count.
+- Undated jobs absent from a recent complete company-board snapshot say
+  **New on company board · original posting date unavailable**.
+- Other newly discovered undated jobs and recent discovery-feed entries can
+  ping with **Age unverified — may be older**. LinkedIn repost dates never
+  certify original publication.
+- Known postings older than 24 hours appear only in full feeds, labeled
+  **Older posting — newly found** with their age at discovery.
+- First baselines, including incomplete first reads, are silent. Collection
+  configuration changes establish another silent baseline. Changing cadence
+  alone does not reset coverage. Existing seen IDs survive upgrades.
+- Every returned posting is indexed before notification filters. Full feeds
+  mean all **matching newly discovered** jobs, not every occupation worldwide.
+- Distinct requisitions are kept even when their company and title match.
+  Canonical URL deduplication is per subscriber and destination channel. A
+  full-feed entry never suppresses an important-channel entry.
 
-- **Apply now:** a ranked, capped, loud alert for fresh matches in configured
-  categories at watchlist companies.
-- **Fresh feeds:** quiet digests of all freshness-qualified subscriber matches,
-  including anything omitted from the loud cap. They become due after five
-  minutes and are sent on the next polling cycle.
+See [the source audit](docs/source-audit.md) for all 206 configured sources and
+known limits. Disabled sources have no direct monitoring; discovery feeds may
+surface their jobs, but cannot guarantee their coverage.
 
-A job must be newly discovered **and** pass the freshness gate:
+## Speed and delivery
 
-- Company-reported posting date within the last **24 hours**. Greenhouse uses
-  `first_published`; edit timestamps are not accepted as publication evidence.
-- If the company supplies no posting date, the job must be absent from a
-  previous complete read of the same board configuration less than **six hours**
-  ago. These alerts say **New on company board · original posting date unavailable**.
-- Known old dates never fall back to first-seen time. First runs, coverage
-  changes, outages, and partial reads cannot certify undated backfills as new.
-- LinkedIn and community-listing sources are **dashboard only**, even when they
-  claim a recent date. This avoids treating a repost or a newly added list entry
-  as a newly published company opening. Companies without a monitored direct
-  source therefore remain searchable but do not currently generate alerts.
+Direct boards have eight worker slots; discovery feeds have two separate
+slots. A shared host is polled by only one worker at a time. Results are
+processed as they finish, without waiting for slower boards. In continuous
+mode, each source is rescheduled independently. Default direct cadence is
+three minutes after a fetch completes; explicit per-source intervals and
+provider backoff still apply. Netflix is set to three minutes. Discovery feeds
+default to 30 minutes unless configured otherwise.
 
-Older and unverified jobs stay searchable. Alert freshness is configured in
-`config.json` under `alert_freshness.max_age_hours` (24) and
-`alert_freshness.observation_max_gap_hours` (6). Existing title, location,
-watchlist, and loud-alert cap rules still apply. Polling and provider outages
-mean delivery is not instantaneous; a company can also republish an opening
-under a new ID, so its reported date is not proof of a brand-new requisition.
+Important jobs are individually queued with no eight-job cutoff. Each drain
+sends up to eight messages, paces requests to each webhook, and uses a ten-second
+budget with persistent provider
+cooldowns; remaining jobs stay queued. Full feeds batch for about one minute.
+An important job expires at its own deadline; full-feed discoveries stay queued
+until delivered. Discord network requests can temporarily block the processing
+thread for their timeout, but slow collection does not block ready delivery.
 
-Recommended Discord channels are `#apply-now-intern`,
-`#apply-now-full-time`, `#internships`, and `#full-time`. Unset optional hooks
-fall back to `DISCORD_WEBHOOK_FULLTIME`, so a single channel also works.
+The operating target is a roughly three-minute check cadence for healthy
+priority boards and important delivery within a minute of processing. These
+are targets, not guarantees: GitHub queue delays, large sources, provider limits,
+and outages can extend them. Successful sends log queue age. Source health
+uses last successful check time as well as failures. Persistent failures or
+stale checks generate one grouped coverage notice, followed by recovery.
 
-Configure secrets in GitHub Actions:
+Delivery is **at least once**. If Discord accepts a message but its response is
+lost, or a runner stops before a checkpoint reaches GitHub, retry may duplicate
+it. Normal acknowledged messages are removed individually; a failed channel
+does not replay another channel's successful messages.
 
-- `DISCORD_WEBHOOK_FULLTIME` (required by the included workflow)
+## GitHub automation
+
+`.github/workflows/jobwatch.yml` validates configuration, restores state, and
+runs `python watcher.py --run-for 1200`. Collection and delivery continue during
+that window; active fetches finish afterward. It saves atomic local snapshots
+every 15 seconds and pushes the latest snapshot every minute, then chains the
+next run. A ten-minute cron schedule restarts broken chains. No extra hosting
+account is required.
+
+Failed downloads never masquerade as a fresh installation. State push failures
+stop the run visibly, with a seven-day recovery artifact. The `state` branch
+contains seen IDs, per-channel deduplication, queues, and health. Schema v5 reads
+older state versions; v4 full-feed queues lose their freshness expiry, while
+legacy queues with no expiry metadata are retired. Existing job/application
+records are retained. Tests run separately in CI on Python 3.11–3.13.
+
+Configure these GitHub Actions secrets:
+
+- `DISCORD_WEBHOOK_FULLTIME` (required; also the fallback destination)
 - `DISCORD_WEBHOOK_APPLY_INTERN`
 - `DISCORD_WEBHOOK_APPLY_FULLTIME`
 - `DISCORD_WEBHOOK_INTERN`
-- `TELEGRAM_BOT_TOKEN` (optional)
-- `HEALTHCHECK_URL` (optional)
+- `HEALTHCHECK_URL` (optional external heartbeat)
+- `TELEGRAM_BOT_TOKEN` (optional existing quiet-feed integration)
 
-Webhook values in `subscribers.json` use `env:SECRET_NAME`; URLs do not belong
-in the repository.
+Webhook URLs are resolved from environment variables and never exported in
+portable state. Important channels use normal Discord notifications; explicit
+user/role mentions require `discord_mention` in subscriber configuration.
+Quiet feeds suppress notifications and disallow mentions.
 
 ## Commands
 
 ```bash
-python watcher.py --serve                 # daily dashboard
-python watcher.py --serve --port 9000     # choose a local port
-python watcher.py --once                  # one polling cycle + state export
-python watcher.py                         # continuous local/VPS polling
-python watcher.py --check                 # validate configuration and regexes
-python watcher.py --verify                # test every enabled source
-python watcher.py --list stripe           # inspect one source
-python watcher.py --test shaun             # send notification examples
-python -m unittest -v                     # run the full test suite
+pip install -r requirements.txt
+python watcher.py --check           # validate configuration; no live sends
+python watcher.py --verify          # live read-only source audit
+python watcher.py --list pinterest  # inspect a company's current postings
+python watcher.py --once            # one pass through due boards
+python watcher.py --run-for 1200    # independently scheduled checks for 20 min
+python watcher.py                  # continuous monitoring
+python -m unittest -v               # regression and acceptance tests
 ```
 
-## Add coverage
+Paginated adapters traverse reported totals or the end of results. Repeated
+pages, count mismatches, missing IDs, malformed rows, time budgets, and failed
+later pages are visible as partial results; usable recovered postings survive.
+The default fetch budget is 180 seconds, with a 1,000-page safety limit.
+`min_interval`, `fetch_budget_seconds`, `max_pages`, and optional
+`page_delay_seconds` control source-specific behavior.
 
-For a direct board, copy its token from its careers URL and add it to
-`config.json`:
+## Existing local dashboard
 
-- `job-boards.greenhouse.io/TOKEN`
-- `jobs.lever.co/TOKEN`
-- `jobs.ashbyhq.com/TOKEN`
-- `jobs.smartrecruiters.com/TOKEN`
-
-For Workday, inspect the careers-page request to
-`/wday/cxs/TENANT/SITE/jobs`. Run `python watcher.py --verify` after any source
-change. To add a person, copy the example entry in `subscribers.json`, choose
-their source set and filters, and configure their own delivery secret.
-
-## Automation and storage
-
-`.github/workflows/jobwatch.yml` runs tests and configuration validation,
-restores the portable state, polls within a 22-minute deadline, and chains a
-successor run. Failed state downloads stop the run instead of silently starting
-fresh. State pushes retry and fail visibly; failed runs retain a recovery
-snapshot for seven days. `.github/workflows/ci.yml` tests pushes and pull requests
-on Python 3.11, 3.12, and 3.13. `state.json` on the force-pushed `state` branch keeps
-deduplication and alert queues durable across ephemeral runners.
-
-Local SQLite stores richer searchable job metadata, run history, and the
-application pipeline. Portable state deliberately excludes private pipeline
-notes. The project has one runtime dependency (`requests`); the dashboard uses
-Python's standard-library HTTP server and plain HTML/CSS/JavaScript.
-
-## Coverage and recovery
-
-Paginated APIs (Workday, SmartRecruiters, Amazon, Phenom, and Eightfold) are read
-until their reported total or the end of the feed. Workday no longer stops at
-300 postings and the other APIs no longer stop at 100. A source has a default
-180-second fetch budget and 1,000-page safety limit, configurable with
-`fetch_budget_seconds` and `max_pages`. Repeated pages, early empty pages, page
-limits, malformed rows, and later-page failures are reported as incomplete;
-postings recovered before a failure are still indexed. Large or blocked boards
-can remain partial: this does not guarantee exhaustive market coverage.
-
-Source requests retry transient errors, honor short `Retry-After` delays, and
-serialize requests to shared Workday tenants and LinkedIn. Failed boards back
-off up to six hours. Partial reads containing jobs keep their regular polling
-cadence. The Sources view shows the last error, recovered posting count, and
-retry time. `--verify` is read-only and exits nonzero for failed or partial reads.
-Markdown tables follow named columns and retain multiple apply links per row.
-
-Job notifications use a durable per-message outbox. Each Discord/Telegram
-message is acknowledged separately, so a failed loud alert is retried and a
-successful feed chunk is not resent just because another chunk failed. Missing
-secrets leave messages queued only while their freshness window remains open.
-Expired pending jobs and outbox messages are discarded before sending, including
-on retry. A grouped message expires with its earliest job to avoid stale alerts.
-Legacy queues have no freshness evidence and are retired on upgrade; the job
-index and application history are kept.
-Portable state version 4 includes freshness deadlines, comparable-read baselines,
-the outbox, and source-health details, reads
-older state versions, and excludes webhook URLs, bot tokens, and application
-notes. The first successful read of a new source still seeds silently.
-
-Delivery is at least once: if a provider accepts a message but its response is
-lost, or the runner stops before its latest checkpoint is uploaded, a retry can
-produce a duplicate. Source-health notices and daily summaries remain best-effort.
-The daily dashboard and the CI runner each use their own local SQLite database;
-GitHub's portable state is notification continuity, not a hosted dashboard.
+`python watcher.py --serve` opens the optional local dashboard with search,
+ranking, saved jobs, application notes, and source health. It uses its own
+SQLite data; GitHub's notification state is not a hosted dashboard sync.
+Application notes never enter the public state branch. The server binds to
+loopback and has no authentication; keep it local.

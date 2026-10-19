@@ -1,5 +1,5 @@
 {
-  "_readme": "One entry per person. companies: list of board names from config.json, or ['all']. filters: optional per-user override — any key omitted falls back to the global filters in config.json; set a key to '' to disable that filter for this user. DELIVERY: feeds get every freshness-qualified matching job quietly. Older jobs and LinkedIn/community discoveries stay in the dashboard; the global alert_freshness policy controls eligibility. Watchlist jobs only ping loudly when their category is in ping_categories (intern, new_grad, other), capped by max_ping_jobs per cycle; overflow remains in the feeds. Any webhook left unset falls back to discord_webhook. Use env:SECRET_NAME for webhook secrets. ops: true alerts after 10 failed polls; digest: true enables the daily summary; mute: true disables a user.",
+  "_readme": "Four channels: all newly discovered matching jobs go to quiet internship/full-time feeds, including older postings labeled as such. Fresh or age-unverified watchlist jobs in ping_categories also go to important channels. Important jobs are queued individually without a count cutoff. First source baselines are silent. Unknown-age pings carry a warning; known old jobs never ping. Webhook values reference environment secrets. ops enables grouped coverage and recovery notices.",
   "shaun": {
     "companies": [
       "all"
@@ -13,7 +13,6 @@
       "intern",
       "new_grad"
     ],
-    "max_ping_jobs": 8,
     "ping_webhooks": {
       "intern": "env:DISCORD_WEBHOOK_APPLY_INTERN",
       "full_time": "env:DISCORD_WEBHOOK_APPLY_FULLTIME"

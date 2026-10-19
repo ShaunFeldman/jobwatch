@@ -10,7 +10,7 @@ from test_reliability import response, subscriber
 
 
 NOW = watcher._iso_epoch('2026-10-19T12:00:00Z')
-DIRECT = {'ats': 'greenhouse', 'token': 'demo'}
+DIRECT = {'ats': 'greenhouse', 'token': 'demo', 'min_interval': 0}
 
 
 def job(jid='new', posted=None):
@@ -33,15 +33,15 @@ class FreshnessPolicyTests(unittest.TestCase):
         for ats in watcher.DISCOVERY_ONLY_ATS:
             with self.subTest(ats=ats):
                 expiry, reason = watcher.alert_freshness(job(posted=NOW - 60), {'ats': ats}, None, {}, NOW)
-                self.assertIsNone(expiry)
+                self.assertGreater(expiry, NOW)
                 self.assertIn('unverified', reason)
 
-    def test_unknown_date_requires_recent_unchanged_complete_baseline(self):
+    def test_unknown_date_warns_unless_recent_complete_baseline(self):
         expiry, note = watcher.alert_freshness(job(), DIRECT, baseline(), {}, NOW)
         self.assertEqual(NOW - 300 + 86400, expiry)
         self.assertIn('date unavailable', note)
         for previous in (None, baseline(age=6*3600), baseline(age=-60), baseline(cfg={'ats': 'ashby', 'token': 'demo'})):
-            self.assertIsNone(watcher.alert_freshness(job(), DIRECT, previous, {}, NOW)[0])
+            self.assertIn("Age unverified", watcher.alert_freshness(job(), DIRECT, previous, {}, NOW)[1])
 
     def test_known_old_or_invalid_date_never_falls_back_to_newly_observed(self):
         for posted in (NOW - 86400 * 10, NOW + 60, 'not a date', float('nan'), float('inf'), -1):
@@ -97,35 +97,38 @@ class FreshnessIntegrationTests(unittest.TestCase):
         if previous:
             self.con.execute('INSERT INTO kv VALUES (?,?)', ('freshness_baseline:demo', json.dumps(previous)))
 
-    def test_new_published_job_alerts_while_old_job_is_stored_only(self):
+    def test_new_published_job_pings_and_old_job_goes_to_full_feed(self):
         self.seed_board()
         self.run_cycle([job('today', NOW-3600), job('ten-days', NOW-864000)])
         self.assertEqual(2, self.con.execute('SELECT COUNT(*) FROM jobs').fetchone()[0])
-        self.assertEqual([('https://example.com/jobs/today',)], self.con.execute('SELECT url FROM pending').fetchall())
+        self.assertEqual(2, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(1, self.con.execute("SELECT COUNT(*) FROM outbox WHERE route LIKE 'ping:%'").fetchone()[0])
         self.assertFalse(watcher.already_alerted(self.con, job('ten-days')))
 
-    def test_undated_backfill_silent_then_observed_new_direct_job_alerts(self):
+    def test_undated_discovery_warns_then_observed_new_job_has_baseline_note(self):
         self.seed_board()
         self.run_cycle([job('backfill')])
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertIn('Age unverified', self.con.execute('SELECT freshness_note FROM pending').fetchone()[0])
         self.run_cycle([job('backfill'), job('new')])
-        row = self.con.execute('SELECT url,posted,freshness_note FROM pending').fetchone()
+        row = self.con.execute("SELECT url,posted,freshness_note FROM pending WHERE url LIKE '%/new'").fetchone()
         self.assertEqual('https://example.com/jobs/new', row[0])
         self.assertIsNone(row[1])
         self.assertIn('date unavailable', row[2])
 
-    def test_recovery_and_changed_collection_do_not_create_undated_alerts(self):
+    def test_recovery_warns_but_changed_collection_seeds_silently(self):
         self.seed_board(baseline())
         self.con.execute("UPDATE boards SET failures=1 WHERE board='demo'")
         self.run_cycle([job('recovered')])
-        self.run_cycle([job('recovered'), job('expanded')], {'ats': 'greenhouse', 'token': 'new-tenant'})
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.run_cycle([job('recovered'), job('expanded')], {'ats': 'greenhouse', 'token': 'new-tenant', 'min_interval': 0})
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
 
     def test_known_job_with_refreshed_date_does_not_realert(self):
         self.seed_board()
         self.run_cycle([job('old', NOW-864000)])
         self.run_cycle([job('old', NOW-60)])
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(0, self.con.execute("SELECT COUNT(*) FROM outbox WHERE route LIKE 'ping:%'").fetchone()[0])
 
     def test_discovery_only_echo_does_not_block_company_alert(self):
         self.seed_board()
@@ -158,7 +161,7 @@ class FreshnessIntegrationTests(unittest.TestCase):
         watcher.export_state(self.con)
         restored = watcher.db_open(':memory:')
         watcher.import_state(restored)
-        self.assertEqual(NOW-60+86400, restored.execute('SELECT expires_at FROM pending').fetchone()[0])
+        self.assertEqual(0, restored.execute('SELECT expires_at FROM pending').fetchone()[0])
         self.assertEqual(NOW-60+86400, restored.execute('SELECT expires_at FROM outbox').fetchone()[0])
         self.assertIsNotNone(restored.execute("SELECT v FROM kv WHERE k='freshness_baseline:demo'").fetchone())
         restored.close()
