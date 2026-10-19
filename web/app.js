@@ -316,7 +316,9 @@ function renderSources() {
   $('#source-rows').innerHTML = sources.map(source => {
     const kind = source.disabled ? 'idle' : source.failures ? 'bad' : source.seeded ? 'ok' : 'idle';
     const text = source.disabled ? 'Disabled' : source.failures ? `${source.failures} failures` : source.seeded ? 'Healthy' : 'Not checked';
-    return `<tr><td>${esc(source.label)}</td><td>${esc(source.adapter || '—')}</td><td>${source.tags.map(tag => `<span class="source-tag">${esc(tag)}</span>`).join('') || '—'}</td><td>${source.last_ok ? esc(age(source.last_ok)) : '—'}</td><td><span class="source-status ${kind}"><i class="${kind}"></i>${esc(text)}</span></td></tr>`;
+    const detail = source.last_error ? `<div class="source-detail">${esc(source.last_error)}</div>` : '';
+    const retry = source.next_poll > Date.now() / 1000 ? `<div class="source-detail">Retry ${esc(new Date(source.next_poll * 1000).toLocaleString())}</div>` : '';
+    return `<tr><td>${esc(source.label)}<div class="source-detail">${source.last_count || 0} postings in last read</div>${detail}${retry}</td><td>${esc(source.adapter || '—')}</td><td>${source.tags.map(tag => `<span class="source-tag">${esc(tag)}</span>`).join('') || '—'}</td><td>${source.last_ok ? esc(age(source.last_ok)) : '—'}</td><td><span class="source-status ${kind}"><i class="${kind}"></i>${esc(text)}</span></td></tr>`;
   }).join('');
 }
 

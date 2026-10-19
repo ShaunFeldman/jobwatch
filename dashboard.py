@@ -219,7 +219,7 @@ class JobwatchService:
             fresh += bool(epoch and now_epoch - epoch <= 86400)
         with self.db() as con:
             source_rows = con.execute(
-                "SELECT board, seeded, last_ok, failures, last_poll FROM boards"
+                "SELECT board, seeded, last_ok, failures, last_poll, last_error, last_count, next_poll FROM boards"
             ).fetchall()
             last_run = con.execute(
                 "SELECT * FROM runs ORDER BY rowid DESC LIMIT 1"
@@ -231,6 +231,9 @@ class JobwatchService:
             1 for name, cfg in self.config.get("boards", {}).items()
             if not name.startswith("_") and not cfg.get("disabled")
         )
+        enabled_names = {name for name, cfg in self.config.get("boards", {}).items()
+                         if not name.startswith("_") and not cfg.get("disabled")}
+        source_rows = [row for row in source_rows if row["board"] in enabled_names]
         healthy = sum(1 for row in source_rows if row["seeded"] and not row["failures"])
         seeded = sum(1 for row in source_rows if row["seeded"])
         recommendations = sorted(
@@ -259,7 +262,7 @@ class JobwatchService:
     def sources(self) -> dict:
         with self.db() as con:
             rows = {r["board"]: dict(r) for r in con.execute(
-                "SELECT board, seeded, last_ok, failures, last_poll FROM boards"
+                "SELECT board, seeded, last_ok, failures, last_poll, last_error, last_count, next_poll FROM boards"
             )}
         sources = []
         for name, cfg in self.config.get("boards", {}).items():
@@ -276,6 +279,9 @@ class JobwatchService:
                 "last_ok": state.get("last_ok"),
                 "failures": state.get("failures", 0),
                 "last_poll": state.get("last_poll", 0),
+                "last_error": state.get("last_error", ""),
+                "last_count": state.get("last_count", 0),
+                "next_poll": state.get("next_poll", 0),
             })
         sources.sort(key=lambda s: (s["disabled"], -s["failures"], s["label"]))
         return {"sources": sources}

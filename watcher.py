@@ -35,7 +35,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
+from email.utils import parsedate_to_datetime
+import threading
 
 import requests
 
@@ -123,9 +125,95 @@ def _rel_age(posted):
 # ================================================================ adapters
 # Each returns list of {id, title, location, url, company}. id stable per board.
 
+class FetchResult(list):
+    """Usable postings plus explicit evidence of incomplete coverage."""
+    def __init__(self, rows=(), warnings=()):
+        super().__init__(rows)
+        self.warnings = list(warnings)
+
+
+def _retry_delay(response, default=2):
+    value = response.headers.get("Retry-After", "") if response is not None else ""
+    try:
+        return max(0, float(value))
+    except (TypeError, ValueError):
+        try:
+            return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+
+def _source_request(method, url, **kwargs):
+    for attempt in range(3):
+        try:
+            response = getattr(requests, method)(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            delay = _retry_delay(exc.response, 2 ** attempt)
+            # Long cooldowns belong to the scheduler, not a sleeping worker.
+            if attempt == 2 or (status != 429 and status < 500) or delay > 10:
+                raise
+            time.sleep(delay)
+
+
+def _pages(fetch, identity, cfg):
+    """Follow all pages; keep recovered rows and flag any incomplete read."""
+    out = FetchResult()
+    seen, offset, total = set(), 0, None
+    deadline = time.monotonic() + cfg.get("fetch_budget_seconds", 180)
+    for _ in range(cfg.get("max_pages", 1000)):
+        try:
+            rows, reported = fetch(offset)
+            if not isinstance(rows, list):
+                raise ValueError("expected a job list")
+            if total is None and reported is not None:
+                total = int(reported)
+            if not rows:
+                if total is not None and offset < total:
+                    out.warnings.append(f"empty page at {offset} of {total} postings")
+                return out
+            added = invalid = 0
+            for row in rows:
+                key = identity(row) if isinstance(row, dict) else None
+                if not key:
+                    invalid += 1
+                    out.warnings.append(f"posting without a stable ID at offset {offset}")
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    out.append(row)
+                    added += 1
+            offset += len(rows)
+            if not added and not invalid:
+                out.warnings.append(f"pagination repeated at offset {offset}")
+                return out
+            if total is not None and offset >= total:
+                return out
+            if time.monotonic() >= deadline:
+                out.warnings.append(f"fetch time budget reached after {offset} postings")
+                return out
+        except Exception as exc:
+            if not out:
+                raise
+            out.warnings.append(f"page at offset {offset}: {type(exc).__name__}: {exc}")
+            return out
+    out.warnings.append(f"page safety limit reached after {offset} postings")
+    return out
+
+
+def _mapped(rows, convert):
+    return FetchResult((convert(row) for row in rows), getattr(rows, "warnings", ()))
+
+
 def fetch_greenhouse(cfg):
     url = f"https://boards-api.greenhouse.io/v1/boards/{cfg['token']}/jobs?content=false"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+    r = _source_request("get", url, headers={"User-Agent": UA}, timeout=TIMEOUT)
     r.raise_for_status()
     return [{
         "id": str(j["id"]),
@@ -133,12 +221,12 @@ def fetch_greenhouse(cfg):
         "location": (j.get("location") or {}).get("name", ""),
         "url": j.get("absolute_url", ""),
         "posted": _iso_epoch(j.get("first_published") or j.get("updated_at")),
-    } for j in r.json().get("jobs", [])]
+    } for j in r.json()["jobs"]]
 
 
 def fetch_lever(cfg):
     url = f"https://api.lever.co/v0/postings/{cfg['token']}?mode=json"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+    r = _source_request("get", url, headers={"User-Agent": UA}, timeout=TIMEOUT)
     r.raise_for_status()
     return [{
         "id": str(j["id"]),
@@ -151,110 +239,90 @@ def fetch_lever(cfg):
 
 def fetch_ashby(cfg):
     url = f"https://api.ashbyhq.com/posting-api/job-board/{cfg['token']}?includeCompensation=true"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+    r = _source_request("get", url, headers={"User-Agent": UA}, timeout=TIMEOUT)
     r.raise_for_status()
     return [{
         "id": str(j.get("id")),
         "title": j.get("title", ""),
-        "location": j.get("location", "") or "",
+        "location": " | ".join(dict.fromkeys(filter(None, [j.get("location")]
+                    + [loc.get("location") for loc in j.get("secondaryLocations", [])]
+                    + (["Remote"] if j.get("isRemote") else [])))),
         "url": j.get("jobUrl", ""),
         "salary": (j.get("compensation") or {}).get("compensationTierSummary", ""),
         "posted": _iso_epoch(j.get("publishedAt")),
-    } for j in r.json().get("jobs", [])]
+    } for j in r.json()["jobs"]]
 
 
 def fetch_smartrecruiters(cfg):
-    t = cfg["token"]
-    url = f"https://api.smartrecruiters.com/v1/companies/{t}/postings?limit=100"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
-    r.raise_for_status()
-    out = []
-    for j in r.json().get("content", []):
-        loc = j.get("location") or {}
-        out.append({
-            "id": str(j.get("id")),
-            "title": j.get("name", ""),
-            "location": ", ".join(x for x in [loc.get("city"), loc.get("country")] if x),
-            "url": f"https://jobs.smartrecruiters.com/{t}/{j.get('id')}",
-        })
-    return out
+    token = cfg["token"]
+    def page(offset):
+        r = _source_request("get", f"https://api.smartrecruiters.com/v1/companies/{token}/postings",
+                            params={"limit": 100, "offset": offset},
+                            headers={"User-Agent": UA}, timeout=TIMEOUT)
+        data = r.json()
+        return data["content"], data.get("totalFound")
+    rows = _pages(page, lambda j: j.get("id"), cfg)
+    return _mapped(rows, lambda j: {
+        "id": str(j["id"]), "title": j.get("name", ""),
+        "location": ", ".join(x for x in [(j.get("location") or {}).get("city"),
+                                          (j.get("location") or {}).get("country")] if x),
+        "url": f"https://jobs.smartrecruiters.com/{token}/{j['id']}",
+        "posted": _iso_epoch(j.get("releasedDate")),
+    })
 
 
 def fetch_workday(cfg):
     host, tenant, site = cfg["host"], cfg["tenant"], cfg["site"]
-    url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    out, offset, total = [], 0, None
-    while True:
-        body = {"appliedFacets": cfg.get("facets", {}), "limit": 20,
-                "offset": offset, "searchText": cfg.get("search", "")}
-        r = requests.post(url, json=body, timeout=TIMEOUT,
-                          headers={"User-Agent": UA, "Accept": "application/json",
-                                   "Content-Type": "application/json"})
-        r.raise_for_status()
+    def page(offset):
+        r = _source_request("post", f"https://{host}/wday/cxs/{tenant}/{site}/jobs",
+                            json={"appliedFacets": cfg.get("facets", {}), "limit": 20,
+                                  "offset": offset, "searchText": cfg.get("search", "")},
+                            headers={"User-Agent": UA, "Accept": "application/json"},
+                            timeout=TIMEOUT)
         data = r.json()
-        if total is None:       # many tenants only report total on page one
-            total = data.get("total", 0)
-        posts = data.get("jobPostings", [])
-        for j in posts:
-            path = j.get("externalPath", "")
-            out.append({
-                "id": path,
-                "title": j.get("title", ""),
-                "location": j.get("locationsText", "") or "",
-                "url": f"https://{host}/en-US/{site}{path}",
-                "posted": _workday_posted_epoch(j.get("postedOn", "")),
-            })
-        offset += 20
-        if not posts or offset >= total or offset >= 300:
-            break
-    return out
+        return data["jobPostings"], data.get("total")
+    rows = _pages(page, lambda j: j.get("externalPath"), cfg)
+    return _mapped(rows, lambda j: {
+        "id": j["externalPath"], "title": j.get("title", ""),
+        "location": j.get("locationsText", "") or "",
+        "url": f"https://{host}/en-US/{site}{j['externalPath']}",
+        "posted": _workday_posted_epoch(j.get("postedOn", "")),
+    })
 
 
 def fetch_amazon_jobs(cfg):
-    """amazon.jobs public search JSON. cfg: query (e.g. 'software intern'),
-    optionally country. Returns newest 100 matches."""
-    params = {
-        "base_query": cfg.get("query", "software engineer intern"),
-        "result_limit": 100, "offset": 0, "sort": "recent",
-    }
-    if cfg.get("country"):
-        params["country"] = cfg["country"]
-    r = requests.get("https://www.amazon.jobs/en/search.json", params=params,
-                     headers={"User-Agent": UA, "Accept": "application/json"},
-                     timeout=TIMEOUT)
-    r.raise_for_status()
-    out = []
-    for j in r.json().get("jobs", []):
-        out.append({
-            "id": str(j.get("id_icims") or j.get("id")),
-            "title": j.get("title", ""),
-            "location": j.get("normalized_location", "") or j.get("location", ""),
-            "url": "https://www.amazon.jobs" + (j.get("job_path") or ""),
-        })
-    return out
+    def page(offset):
+        params = {"base_query": cfg.get("query", "software engineer intern"),
+                  "result_limit": 100, "offset": offset, "sort": "recent"}
+        if cfg.get("country"):
+            params["country"] = cfg["country"]
+        data = _source_request("get", "https://www.amazon.jobs/en/search.json", params=params,
+                               headers={"User-Agent": UA}, timeout=TIMEOUT).json()
+        if data.get("error"):
+            raise ValueError(str(data["error"]))
+        return data["jobs"], data.get("hits")
+    rows = _pages(page, lambda j: j.get("id_icims") or j.get("id"), cfg)
+    return _mapped(rows, lambda j: {
+        "id": str(j.get("id_icims") or j["id"]), "title": j.get("title", ""),
+        "location": j.get("normalized_location") or j.get("location", ""),
+        "url": "https://www.amazon.jobs" + (j.get("job_path") or ""),
+        "posted": _iso_epoch(j.get("posted_date")),
+    })
 
 
 def fetch_microsoft(cfg):
-    """Microsoft careers public search JSON. cfg: query."""
-    params = {"q": cfg.get("query", "software engineer"), "l": "en_us",
-              "pg": 1, "pgSz": 100, "o": "Relevance", "flt": "true"}
-    r = requests.get("https://gcsservices.careers.microsoft.com/search/api/v1/search",
-                     params=params, headers={"User-Agent": UA, "Accept": "application/json"},
-                     timeout=TIMEOUT)
-    r.raise_for_status()
-    jobs = (((r.json().get("operationResult") or {}).get("result") or {}).get("jobs")) or []
-    out = []
-    for j in jobs:
-        jid = str(j.get("jobId", ""))
-        props = j.get("properties") or {}
-        locs = props.get("locations") or []
-        out.append({
-            "id": jid,
-            "title": j.get("title", ""),
-            "location": "; ".join(locs[:3]),
-            "url": f"https://jobs.careers.microsoft.com/global/en/job/{jid}",
-        })
-    return out
+    def page(offset):
+        data = _source_request("get", "https://gcsservices.careers.microsoft.com/search/api/v1/search",
+            params={"q": cfg.get("query", "software engineer"), "l": "en_us",
+                    "pg": offset // 100 + 1, "pgSz": 100, "o": "Relevance", "flt": "true"},
+            headers={"User-Agent": UA}, timeout=TIMEOUT).json()["operationResult"]["result"]
+        return data["jobs"], data.get("totalJobs")
+    rows = _pages(page, lambda j: j.get("jobId"), cfg)
+    return _mapped(rows, lambda j: {
+        "id": str(j["jobId"]), "title": j.get("title", ""),
+        "location": "; ".join((j.get("properties") or {}).get("locations") or []),
+        "url": f"https://jobs.careers.microsoft.com/global/en/job/{j['jobId']}",
+    })
 
 
 def fetch_github_listings(cfg):
@@ -267,7 +335,7 @@ def fetch_github_listings(cfg):
     branch = cfg.get("branch", "dev")
     path = cfg.get("path", ".github/scripts/listings.json")
     url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+    r = _source_request("get", url, headers={"User-Agent": UA}, timeout=60)
     r.raise_for_status()
     out = []
     for j in r.json():
@@ -277,7 +345,7 @@ def fetch_github_listings(cfg):
         out.append({
             "id": str(j.get("id")),
             "title": j.get("title", ""),
-            "location": " | ".join(locs[:3]),
+            "location": " | ".join(locs),
             "url": j.get("url", ""),
             "company": j.get("company_name", ""),
             "posted": j.get("date_posted") or j.get("date_updated") or None,
@@ -319,7 +387,7 @@ def fetch_marqeta(cfg):
     so parsing that first-party table is more reliable than a stale token."""
     base = cfg.get("url", "https://www.marqeta.com")
     path = cfg.get("path", "/company/careers")
-    r = requests.get(base.rstrip("/") + path, headers={"User-Agent": UA},
+    r = _source_request("get", base.rstrip("/") + path, headers={"User-Agent": UA},
                      timeout=TIMEOUT)
     r.raise_for_status()
     out, seen = [], set()
@@ -342,94 +410,112 @@ def fetch_marqeta(cfg):
     return out
 
 
+def fetch_hightouch(cfg):
+    """The official site embeds its complete live listing in Next.js page data."""
+    text = _source_request("get", "https://hightouch.com/careers",
+                           headers={"User-Agent": UA}, timeout=TIMEOUT).text
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', text, re.S)
+    if not match:
+        raise ValueError("Hightouch careers page data missing")
+    rows = json.loads(match.group(1))["props"]["pageProps"]["jobPostings"]
+    return [{"id": j["id"], "title": j["title"], "location": j.get("locationName", ""),
+             "company": "Hightouch", "url": f"https://hightouch.com/careers/{j['id']}"}
+            for j in rows]
+
+
 def fetch_github_md(cfg):
-    """Community listing repos that publish a markdown table (speedyapply,
-    Canadian lists, off-season lists, ...). cfg: repo, branch (default 'main'),
-    path (default 'README.md'), cols: 0-based column indexes for
-    company/title/url (+ optional location/salary). Handles md links, HTML
-    anchors, shields.io Apply badges, and repos that repeat/omit the company
-    on continuation rows."""
-    cols = cfg["cols"]
+    """Read named table columns, tolerating reordered columns and multiple roles."""
     url = (f"https://raw.githubusercontent.com/{cfg['repo']}/"
            f"{cfg.get('branch', 'main')}/{cfg.get('path', 'README.md')}")
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
-    r.raise_for_status()
-    need = max(cols.values()) + 1
+    text = _source_request("get", url, headers={"User-Agent": UA}, timeout=60).text
+    cols = dict(cfg["cols"])
+    aliases = {"company": {"company", "name"}, "title": {"role", "position", "job title", "title"},
+               "location": {"location", "locations"}, "url": {"apply", "application", "link", "links", "application/link", "posting"},
+               "salary": {"salary", "pay", "salary ($)"}}
     out, seen, prev_company = [], set(), ""
-    for row in r.text.splitlines():
-        if not row.startswith("|"):
+    for row in text.splitlines():
+        if row.startswith("#"):
+            prev_company = ""
+        if not row.lstrip().startswith("|"):
             continue
-        cells = [c.strip() for c in row.strip().strip("|").split("|")]
-        if len(cells) < need:
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", row.strip().strip("|"))]
+        labels = [_cell_text(c).lower() for c in cells]
+        detected = {key: i for key, names in aliases.items() for i, label in enumerate(labels) if label in names}
+        if "company" in detected and "title" in detected:
+            cols = detected
+            cols.setdefault("url", cols["title"])
+            prev_company = ""
+            continue
+        if len(cells) < max(cols.values()) + 1:
             continue
         title = _cell_text(cells[cols["title"]])
-        if (not title or set(title) <= set("-: ")
-                or title.lower() in ("role", "position", "job title")):
-            continue                     # header / separator rows
-        joburl = _cell_url(cells[cols["url"]]) or _cell_url(cells[cols["title"]])
-        if not joburl:
+        if not title or set(title) <= set("-: "):
             continue
         company = _cell_text(cells[cols["company"]]) or prev_company
         prev_company = company
-        jid = hashlib.md5(joburl.encode()).hexdigest()[:16]
-        if jid in seen:
+        if not company or "🔒" in cells[cols["url"]] or "~~" in cells[cols["title"]]:
             continue
-        seen.add(jid)
-        job = {
-            "id": jid,
-            "title": title,
-            "location": _cell_text(cells[cols["location"]]) if "location" in cols else "",
-            "url": joburl,
-            "company": company,
-        }
-        if "salary" in cols:
-            sal = _cell_text(cells[cols["salary"]])
-            if sal and sal != "-":
-                job["salary"] = sal
-        out.append(job)
+        cell = cells[cols["url"]]
+        urls = [html.unescape(m.group(1)) for m in re.finditer(r'\]\((https?://[^)\s]+)\)', _MD_IMG.sub("", cell))]
+        urls += [html.unescape(u) for u in _HREF.findall(cell)]
+        if not urls:
+            fallback = _cell_url(cell) or _cell_url(cells[cols["title"]])
+            urls = [html.unescape(fallback)] if fallback else []
+        for joburl in dict.fromkeys(urls):
+            if any(host in urlsplit(joburl).netloc for host in ("shields.io", "githubusercontent.com")):
+                continue
+            jid = hashlib.md5(joburl.encode()).hexdigest()[:16]
+            if jid in seen:
+                continue
+            seen.add(jid)
+            job = {"id": jid, "title": title, "company": company, "url": joburl,
+                   "location": _cell_text(cells[cols["location"]]) if "location" in cols else ""}
+            if "salary" in cols:
+                job["salary"] = _cell_text(cells[cols["salary"]])
+            out.append(job)
+    if not out and not cfg.get("allow_empty", False):
+        raise ValueError("no job rows parsed; listing table may have changed")
     return out
 
 
 def fetch_linkedin(cfg):
     """LinkedIn public guest search — same postings as linkedin.com/jobs, no
     login. cfg: queries (list) or query, location ('United States'), recency
-    ('r86400' = posted in last 24h), pages (default 3, ~10 results/page).
-    Datacenter IPs get rate-limited sometimes; failures are quiet by design."""
+    ('r604800' = posted in last week), pages (default 10).
+    Query failures and page limits are exposed as partial coverage."""
+    cfg = {**cfg, "_deadline": time.monotonic() + cfg.get("fetch_budget_seconds", 180)}
     queries = cfg.get("queries") or [cfg.get("query", "software engineer intern")]
     location = cfg.get("location", "United States")
-    out, seen, errors = [], set(), []
+    out, seen, errors = FetchResult(), set(), []
     for q in queries:
+        if time.monotonic() >= cfg["_deadline"]:
+            out.warnings.append("LinkedIn fetch time budget reached; remaining queries deferred")
+            break
         try:
             _linkedin_query(cfg, q, location, out, seen)
         except Exception as e:      # one rate-limited query shouldn't kill the rest
             errors.append(e)
     if not out and errors:
         raise errors[0]
-    # Repost filter: job ids are chronological, so an id far below the batch's
-    # newest while claiming to be <24h old is a repost/relist of a stale req.
-    # ~1.2M ids/day globally; 4M ≈ 3 days of slack for genuinely new posts.
-    if out:
-        watermark = max(int(j["id"]) for j in out)
-        drift = cfg.get("max_id_drift", 4_000_000)
-        keep = [j for j in out if watermark - int(j["id"]) <= drift]
-        if len(keep) < len(out):
-            log(f"  linkedin({location}): dropped {len(out) - len(keep)} repost(s) by id drift")
-        out = keep
-    return out
+    return FetchResult(out, out.warnings + [f"query failed: {type(e).__name__}: {e}" for e in errors])
 
 
 def _linkedin_query(cfg, q, location, out, seen):
     start = 0
-    for _ in range(cfg.get("pages", 3)):
-        r = requests.get(
-            "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
-            params={"keywords": q, "location": location,
-                    "f_TPR": cfg.get("recency", "r86400"), "start": start},
-            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=TIMEOUT)
-        if r.status_code in (400, 404):         # past the end of results
-            break
-        r.raise_for_status()
+    for _ in range(cfg.get("pages", 10)):
+        if time.monotonic() >= cfg.get("_deadline", float("inf")):
+            raise requests.Timeout("LinkedIn fetch time budget reached")
+        try:
+            r = _source_request("get",
+                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+                params={"keywords": q, "location": location,
+                        "f_TPR": cfg.get("recency", "r604800"), "start": start, "sortBy": "DD"},
+                headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+                timeout=TIMEOUT)
+        except requests.HTTPError as exc:
+            if start and exc.response is not None and exc.response.status_code in (400, 404):
+                break
+            raise
         got = 0
         for card in r.text.split("<li")[1:]:
             m = re.search(r"urn:li:jobPosting:(\d+)", card)
@@ -453,16 +539,20 @@ def _linkedin_query(cfg, q, location, out, seen):
                 "posted": _iso_epoch(md.group(1)) if md else None,
             })
         if not got:
+            if "<html" in r.text.lower() or "urn:li:jobPosting:" in r.text:
+                raise ValueError("LinkedIn returned an unexpected page instead of job cards")
             break
         start += got
         time.sleep(1.0)                         # be polite, one IP
+    else:
+        out.warnings.append(f"LinkedIn query {q!r} reached its page limit")
 
 
 def fetch_janestreet(cfg):
     """Jane Street's own positions feed — no ATS, plain JSON. The
     availability field ('Full-Time: New Grad', 'Internship', ...) is folded
     into the title so intern/new-grad categorization and filters see it."""
-    r = requests.get("https://www.janestreet.com/jobs/main.json",
+    r = _source_request("get", "https://www.janestreet.com/jobs/main.json",
                      headers={"User-Agent": UA, "Accept": "application/json"},
                      timeout=TIMEOUT)
     r.raise_for_status()
@@ -494,61 +584,42 @@ def fetch_janestreet(cfg):
 
 
 def fetch_phenom(cfg):
-    """Phenom People career sites (jobs.rbc.com etc). cfg: host, query,
-    size (default 100), url ('https://host/xx/en/job/{id}' template)."""
-    body = {"lang": "en_us", "deviceType": "desktop", "country": "us",
-            "pageName": "search-results", "ddoKey": "refineSearch", "from": 0,
-            "jobs": True, "counts": True, "size": cfg.get("size", 100),
-            "clearAll": False, "jdsource": "facets", "siteType": "external",
-            "keywords": cfg.get("query", ""), "global": True,
-            "selected_fields": {}, "all_fields": ["category", "location"]}
-    r = requests.post(f"https://{cfg['host']}/widgets", json=body,
-                      headers={"User-Agent": UA, "Accept": "application/json",
-                               "Content-Type": "application/json"},
-                      timeout=TIMEOUT)
-    r.raise_for_status()
+    def page(offset):
+        body = {"lang": "en_us", "deviceType": "desktop", "country": "us",
+                "pageName": "search-results", "ddoKey": "refineSearch", "from": offset,
+                "jobs": True, "counts": True, "size": cfg.get("size", 100),
+                "clearAll": False, "jdsource": "facets", "siteType": "external",
+                "keywords": cfg.get("query", ""), "global": True,
+                "selected_fields": {}, "all_fields": ["category", "location"]}
+        data = _source_request("post", f"https://{cfg['host']}/widgets", json=body,
+            headers={"User-Agent": UA, "Accept": "application/json"},
+            timeout=TIMEOUT).json()["refineSearch"]["data"]
+        return data["jobs"], data.get("totalHits")
+    rows = _pages(page, lambda j: j.get("jobId") or j.get("reqId"), cfg)
     url_tmpl = cfg.get("url", f"https://{cfg['host']}/en/job/{{id}}")
-    out = []
-    for j in r.json().get("refineSearch", {}).get("data", {}).get("jobs", []):
-        jid = str(j.get("jobId") or j.get("reqId") or "")
-        loc = (j.get("cityStateCountry") or j.get("cityState")
-               or j.get("location") or j.get("city") or "")
-        out.append({
-            "id": jid,
-            "title": j.get("title", ""),
-            "location": loc if isinstance(loc, str) else "; ".join(loc[:3]),
-            "url": j.get("applyUrl") or url_tmpl.format(id=jid),
-        })
-    return out
+    def convert(j):
+        jid = str(j.get("jobId") or j.get("reqId"))
+        loc = j.get("cityStateCountry") or j.get("cityState") or j.get("location") or j.get("city") or ""
+        return {"id": jid, "title": j.get("title", ""),
+                "location": loc if isinstance(loc, str) else "; ".join(loc),
+                "url": j.get("applyUrl") or url_tmpl.format(id=jid)}
+    return _mapped(rows, convert)
 
 
 def fetch_eightfold(cfg):
-    """Eightfold-powered career sites (Netflix etc). cfg: host
-    ('explore.jobs.netflix.net'), domain ('netflix.com'), optional query."""
-    out, start = [], 0
-    while start < cfg.get("max", 100):      # API serves 10 per page
-        params = {"domain": cfg["domain"], "start": start, "num": 10,
-                  "sort_by": "timestamp"}
+    def page(offset):
+        params = {"domain": cfg["domain"], "start": offset, "num": 10, "sort_by": "timestamp"}
         if cfg.get("query"):
             params["query"] = cfg["query"]
-        r = requests.get(f"https://{cfg['host']}/api/apply/v2/jobs", params=params,
-                         headers={"User-Agent": UA, "Accept": "application/json"},
-                         timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        positions = data.get("positions", [])
-        for p in positions:
-            out.append({
-                "id": str(p.get("id")),
-                "title": p.get("name", ""),
-                "location": p.get("location", "") or "",
-                "url": p.get("canonicalPositionUrl")
-                       or f"https://{cfg['host']}/careers/job/{p.get('id')}",
-            })
-        start += len(positions)
-        if not positions or start >= data.get("count", 0):
-            break
-    return out
+        data = _source_request("get", f"https://{cfg['host']}/api/apply/v2/jobs", params=params,
+            headers={"User-Agent": UA}, timeout=TIMEOUT).json()
+        return data["positions"], data.get("count")
+    rows = _pages(page, lambda j: j.get("id"), cfg)
+    return _mapped(rows, lambda j: {
+        "id": str(j["id"]), "title": j.get("name", ""),
+        "location": j.get("location", "") or "",
+        "url": j.get("canonicalPositionUrl") or f"https://{cfg['host']}/careers/job/{j['id']}",
+    })
 
 
 ADAPTERS = {
@@ -566,6 +637,7 @@ ADAPTERS = {
     "janestreet": fetch_janestreet,
     "phenom": fetch_phenom,
     "marqeta": fetch_marqeta,
+    "hightouch": fetch_hightouch,
 }
 
 
@@ -573,6 +645,7 @@ ADAPTERS = {
 def db_open(path=None):
     con = sqlite3.connect(path if path is not None else DB_PATH)
     con.execute("PRAGMA busy_timeout=5000")
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS jobs(
         board TEXT, job_id TEXT, title TEXT, location TEXT, url TEXT,
         first_seen TEXT, last_seen TEXT,
@@ -584,6 +657,14 @@ def db_open(path=None):
     con.execute("""CREATE TABLE IF NOT EXISTS boards(
         board TEXT PRIMARY KEY, seeded INTEGER DEFAULT 0,
         last_ok TEXT, failures INTEGER DEFAULT 0, last_poll REAL DEFAULT 0)""")
+    columns = {r[1] for r in con.execute("PRAGMA table_info(boards)")}
+    for column, definition in {"last_error": "TEXT DEFAULT ''", "last_count": "INTEGER DEFAULT 0",
+                               "next_poll": "REAL DEFAULT 0"}.items():
+        if column not in columns:
+            con.execute(f"ALTER TABLE boards ADD COLUMN {column} {definition}")
+    con.execute("""CREATE TABLE IF NOT EXISTS outbox(
+        id TEXT PRIMARY KEY, sub TEXT, route TEXT, payload TEXT,
+        created_at TEXT, attempts INTEGER DEFAULT 0, next_try REAL DEFAULT 0)""")
     con.execute("""CREATE TABLE IF NOT EXISTS alerted(
         key TEXT PRIMARY KEY, ts TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS sends(
@@ -634,15 +715,17 @@ def export_state(con):
     older state files did) made every imported row look newly seen, so the
     90-day pruning window could never expire and state.json grew forever.
     """
-    state = {"version": 2, "boards": {}, "alerted": []}
-    for board, seeded, last_poll, failures in con.execute(
-            "SELECT board, seeded, last_poll, failures FROM boards"):
+    state = {"version": 3, "boards": {}, "alerted": []}
+    for board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll in con.execute(
+            "SELECT board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll FROM boards"):
         jobs = [list(r) for r in con.execute(
             "SELECT job_id, last_seen FROM jobs WHERE board=? ORDER BY job_id",
             (board,))]
         state["boards"][board] = {"seeded": seeded, "jobs": jobs,
                                   "lp": int(last_poll or 0),
-                                  "f": failures or 0}
+                                  "f": failures or 0, "last_ok": last_ok,
+                                  "last_error": last_error, "last_count": last_count,
+                                  "next_poll": next_poll}
     state["alerted"] = [list(r) for r in con.execute(
         "SELECT key, ts FROM alerted ORDER BY key")]
     state["recent"] = [list(r) for r in con.execute(
@@ -650,6 +733,8 @@ def export_state(con):
     state["pending"] = [list(r) for r in con.execute(
         "SELECT sub, tier, ts, company, title, url, location, salary, posted "
         "FROM pending")]
+    state["outbox"] = [list(r) for r in con.execute(
+        "SELECT id, sub, route, payload, created_at, attempts, next_try FROM outbox")]
     state["kv"] = dict(con.execute("SELECT k, v FROM kv"))
     tmp = STATE_JSON.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, separators=(",", ":")))
@@ -661,9 +746,10 @@ def import_state(con):
     ts = now()
     for board, b in state.get("boards", {}).items():
         con.execute(
-            "INSERT OR REPLACE INTO boards(board, seeded, last_poll, failures) "
-            "VALUES (?,?,?,?)",
-            (board, b.get("seeded", 1), b.get("lp", 0), b.get("f", 0)))
+            "INSERT OR REPLACE INTO boards(board, seeded, last_poll, failures, last_ok, last_error, last_count, next_poll) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (board, b.get("seeded", 1), b.get("lp", 0), b.get("f", 0),
+             b.get("last_ok"), b.get("last_error", ""), b.get("last_count", 0), b.get("next_poll", 0)))
         # v1 stored only ``ids``.  Accept it once for a seamless migration;
         # v2 retains last_seen so stale jobs can actually age out.
         jobs = b.get("jobs")
@@ -687,6 +773,8 @@ def import_state(con):
     con.executemany("INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?)",
                     [tuple(r) + (None,) * (9 - len(r))
                      for r in state.get("pending", [])])
+    con.executemany("INSERT OR IGNORE INTO outbox VALUES (?,?,?,?,?,?,?)",
+                    state.get("outbox", []))
     con.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)",
                     list(state.get("kv", {}).items()))
     con.commit()
@@ -697,10 +785,28 @@ def import_state(con):
 def canon_url(url):
     if not url:
         return ""
-    p = urlsplit(url.strip().lower())
-    host = p.netloc.replace("www.", "")
+    p = urlsplit(html.unescape(url.strip()))
+    host = p.netloc.lower().removeprefix("www.")
     path = p.path.rstrip("/")
-    return f"{host}{path}"
+    query_items = dict(parse_qsl(p.query))
+    if host in {"boards.greenhouse.io", "job-boards.greenhouse.io", "boards.eu.greenhouse.io", "job-boards.eu.greenhouse.io"}:
+        host = host.replace("boards.", "job-boards.", 1) if host.startswith("boards.") else host
+        # gh_jid is redundant only when the same ID is already in the job path.
+        if path.rsplit("/", 1)[-1] == query_items.get("gh_jid"):
+            query_items.pop("gh_jid")
+    if host.endswith("myworkdayjobs.com"):
+        path = re.sub(r"^/[a-z]{2}-[A-Z]{2}/", "/", path)
+    if host == "amazon.jobs":
+        match = re.search(r"/(?:[a-z]{2}/)?jobs/(\d+)", path)
+        if match:
+            path = "/jobs/" + match.group(1)
+    # Keep identity-bearing query parameters (jobId, gh_jid, requisitionId, ...).
+    tracking = {"source", "src", "ref", "referrer", "gh_src", "lever-source", "lever-origin", "trk", "trackingId", "fbclid", "gclid"}
+    query = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if not (k == "gh_jid" and k not in query_items)
+             if k not in tracking and not k.lower().startswith("utm_")
+             and not (host == "zapply.jobs" and k == "s")]
+    return f"{host}{path}" + ("?" + urlencode(sorted(query)) if query else "")
 
 
 _CO_NOISE = re.compile(r"\(.*?\)|\b(incorporated|corporation|company|inc|llc|ltd|corp|co)\b\.?",
@@ -717,20 +823,18 @@ def name_key(company, title, normalize=False):
 
 
 def dedupe_keys(job):
-    """LinkedIn hides direct apply URLs from guests, so a LinkedIn posting and
-    its ATS twin never share a URL — company|title keys (exact + normalized
-    company) do the cross-source matching instead."""
-    ks = []
+    """Distinct requisitions must survive even when company/title/location match.
+
+    A company/title heuristic cannot prove two apply links are the same job.
+    Prefer an occasional cross-site duplicate to hiding an actual opening.
+    Legacy name-only keys in portable state deliberately no longer suppress URLs.
+    """
     cu = canon_url(job.get("url", ""))
     if cu:
-        ks.append(f"url:{cu}")
-    nk = name_key(job.get("company", ""), job.get("title", ""))
-    if nk:
-        ks.append(nk)
-    nk2 = name_key(job.get("company", ""), job.get("title", ""), normalize=True)
-    if nk2 and nk2 != nk:
-        ks.append(nk2)
-    return ks
+        return [f"url:{cu}"]
+    nk = name_key(job.get("company", ""), job.get("title", ""), normalize=True)
+    location = re.sub(r"\s+", " ", job.get("location", "").strip().casefold())
+    return [f"{nk}|{location}"] if nk else []
 
 
 def already_alerted(con, job):
@@ -797,6 +901,7 @@ def load_subscribers(global_filters):
             "max_ping_jobs": max(0, int(s.get("max_ping_jobs", 10))),
             "ops": bool(s.get("ops")),
             "digest": bool(s.get("digest")),
+            "discord_configured": bool(s.get("discord_webhook") or any((s.get("ping_webhooks") or {}).values()) or any((s.get("feeds") or {}).values())),
             "discord": _resolve_secret(s.get("discord_webhook", "")),
             "ping_hooks": {k: _resolve_secret(v, quiet=True)
                            for k, v in (s.get("ping_webhooks") or {}).items()},
@@ -818,13 +923,15 @@ def _post_with_retry(fn, what):
                                  r.json().get("retry_after", 2))
                 except Exception:
                     wait = 2.0
-                time.sleep(min(wait, 15))
+                if wait > 15:
+                    return False
+                time.sleep(max(0, wait))
                 continue
             r.raise_for_status()
             return True
         except Exception as e:
             if attempt == SEND_RETRIES - 1:
-                log(f"! send failed ({what}): {e}")
+                log(f"! send failed ({what}): {type(e).__name__}")
                 return False
             time.sleep(2 ** attempt)
     return False
@@ -869,7 +976,7 @@ def _group(jobs):
                    for g in groups.values()), key=lambda kv: kv[0].lower())
 
 
-def send_discord_ping(webhook, jobs, kind, mention="", omitted=0):
+def send_discord_ping(webhook, jobs, kind, mention="", omitted=0, enqueue=None):
     """The apply-now tier: one rich embed PER JOB (clickable title, location,
     salary) so each ping is a self-contained application card. kind is
     'internship' or 'new grad role'. The header line is plain content, so
@@ -925,9 +1032,11 @@ def send_discord_ping(webhook, jobs, kind, mention="", omitted=0):
         payload = {"embeds": embeds[i:i + 10]}
         if i == 0:
             payload["content"] = header
-        ok &= _post_with_retry(
-            lambda p=payload: requests.post(webhook, json=p, timeout=10),
-            "discord")
+        if enqueue:
+            enqueue(payload)
+        else:
+            ok &= _post_with_retry(
+                lambda p=payload: requests.post(webhook, json=p, timeout=10), "discord")
     return ok
 
 
@@ -984,7 +1093,7 @@ def _pack(blocks, limit):
     return descs
 
 
-def send_discord_feed(webhook, label, jobs, color, watch=None):
+def send_discord_feed(webhook, label, jobs, color, watch=None, enqueue=None):
     """Silent digest embed(s): jobs grouped under bold company names, @silent
     flag so the channel fills up quietly for browsing whenever."""
     descs = _pack(_feed_blocks(jobs, watch), 3500)
@@ -999,9 +1108,11 @@ def send_discord_feed(webhook, label, jobs, color, watch=None):
                                "color": color, "timestamp": ts,
                                "footer": {"text": "jobwatch · quiet digest"}}],
                    "flags": 4096}
-        ok &= _post_with_retry(
-            lambda p=payload: requests.post(webhook, json=p, timeout=10),
-            "discord")
+        if enqueue:
+            enqueue(payload)
+        else:
+            ok &= _post_with_retry(
+                lambda p=payload: requests.post(webhook, json=p, timeout=10), "discord")
     return ok
 
 
@@ -1013,19 +1124,21 @@ def send_discord_note(webhook, title, desc, color):
         lambda: requests.post(webhook, json=payload, timeout=10), "discord")
 
 
-def send_telegram(chat_id, text):
+def send_telegram(chat_id, text, enqueue=None):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not token:
+    if not token and not enqueue:
         log("! telegram configured but TELEGRAM_BOT_TOKEN not set")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok = True
     for chunk in _chunks(text, 3900):
-        ok &= _post_with_retry(
-            lambda c=chunk: requests.post(url, json={
-                "chat_id": chat_id, "text": c, "disable_web_page_preview": True
-            }, timeout=10),
-            "telegram")
+        payload = {"text": chunk, "disable_web_page_preview": True}
+        if enqueue:
+            enqueue(payload)
+        else:
+            ok &= _post_with_retry(
+                lambda p=payload: requests.post(url, json={"chat_id": chat_id, **p}, timeout=10),
+                "telegram")
     return ok
 
 
@@ -1095,29 +1208,79 @@ def deliver(sub, jobs, con):
         cat = _category(pair[1]["title"])
         tiers["ping_intern" if cat == "intern" else "ping_ft"].append(pair)
 
-    main = sub["discord"]
-    ok = True
-    if tiers["ping_intern"]:
-        hook = sub["ping_hooks"].get("intern") or main
-        if hook:
-            ok &= send_discord_ping(hook, tiers["ping_intern"],
-                                    "internship", mention=sub["mention"],
-                                    omitted=omitted)
+    for tier, kind in (("ping_intern", "internship"), ("ping_ft", "role")):
+        if tiers[tier] and sub.get("discord_configured", True):
+            route = "ping:intern" if tier == "ping_intern" else "ping:full_time"
+            send_discord_ping("", tiers[tier], kind, mention=sub["mention"], omitted=omitted,
+                enqueue=lambda payload, route=route: _enqueue(con, sub["name"], route, payload))
             omitted = 0
-    if tiers["ping_ft"]:
-        hook = sub["ping_hooks"].get("full_time") or main
-        if hook:
-            ok &= send_discord_ping(hook, tiers["ping_ft"],
-                                    "role", mention=sub["mention"],
-                                    omitted=omitted)
     hot_all = tiers["ping_intern"] + tiers["ping_ft"]
     if sub["telegram_chat"] and hot_all:
-        ok &= send_telegram(sub["telegram_chat"],
-                            "🎯 apply now\n\n" + _telegram_text(hot_all))
-    for b, j in jobs:
-        con.execute("INSERT INTO sends VALUES (?,?,?,?,?)",
-                    (now(), sub["name"], b, j["id"], int(ok)))
-    return ok
+        send_telegram(sub["telegram_chat"], "🎯 apply now\n\n" + _telegram_text(hot_all),
+            enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload))
+    return True
+
+
+def _enqueue(con, subscriber, route, payload):
+    # Store channel references, never webhook URLs or bot tokens in portable state.
+    encoded = json.dumps(payload, sort_keys=True)
+    key = hashlib.sha256(f"{subscriber}|{route}|{encoded}".encode()).hexdigest()
+    con.execute("INSERT OR IGNORE INTO outbox(id, sub, route, payload, created_at) VALUES (?,?,?,?,?)",
+                (key, subscriber, route, encoded, now()))
+
+
+def flush_outbox(con, subs, checkpoint=None):
+    """Acknowledge each message independently; retry failures across restarts."""
+    con.commit()  # Collected IDs and their notification queues become durable together.
+    if checkpoint:
+        checkpoint()
+    subscribers = {s["name"]: s for s in subs}
+    blocked = set(con.execute("SELECT sub, route FROM outbox WHERE next_try > ?", (time.time(),)))
+    deadline = time.monotonic() + 90
+    rows = con.execute("SELECT id, sub, route, payload, attempts FROM outbox WHERE next_try <= ? ORDER BY CASE WHEN route LIKE 'ping:%' THEN 0 ELSE 1 END, created_at, rowid LIMIT 100",
+                       (time.time(),)).fetchall()
+    for key, name, route, encoded, attempts in rows:
+        if time.monotonic() >= deadline:
+            break
+        sub = subscribers.get(name)
+        if not sub or (name, route) in blocked:
+            continue
+        payload = json.loads(encoded)
+        if route == "telegram":
+            token = os.environ.get("TELEGRAM_BOT_TOKEN")
+            if not token or not sub["telegram_chat"]:
+                blocked.add((name, route))
+                continue
+            endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload["chat_id"] = sub["telegram_chat"]
+        else:
+            kind, tier = route.split(":", 1)
+            mapping = sub["ping_hooks"] if kind == "ping" else sub["feeds"]
+            endpoint = mapping.get(tier) or sub["discord"]
+            if not endpoint:
+                blocked.add((name, route))
+                continue
+        retry_after = 0
+        def send():
+            nonlocal retry_after
+            response = requests.post(endpoint, json=payload, timeout=10)
+            if response.status_code == 429:
+                retry_after = max(retry_after, _retry_delay(response, 60))
+                try:
+                    retry_after = max(retry_after, float(response.json().get("retry_after", 0)))
+                except (TypeError, ValueError):
+                    pass
+            return response
+        ok = _post_with_retry(send, route)
+        if ok:
+            con.execute("DELETE FROM outbox WHERE id=?", (key,))
+        else:
+            blocked.add((name, route))
+            con.execute("UPDATE outbox SET attempts=attempts+1, next_try=? WHERE id=?",
+                        (time.time() + max(retry_after, min(3600, 60 * 2 ** min(attempts, 6))), key))
+        con.commit()
+    if checkpoint:
+        checkpoint()
 
 
 def flush_feeds(config, con, subs, force=False):
@@ -1146,26 +1309,18 @@ def flush_feeds(config, con, subs, force=False):
             by_tier.setdefault(tier, []).append(
                 ("", {"company": company, "title": title, "url": url,
                       "location": location, "salary": salary, "posted": posted}))
-        main = sub["discord"]
-        watch = sub.get("watch")
-        ok = True
-        if by_tier["intern"]:
-            hook = sub["feeds"].get("intern") or main
-            if hook:
-                ok &= send_discord_feed(hook, "🛠️ {n} new internship{s}",
-                                        by_tier["intern"], 0x5865F2, watch)
-        if by_tier["ft"]:
-            hook = sub["feeds"].get("full_time") or main
-            if hook:
-                ok &= send_discord_feed(hook,
-                                        "💼 {n} new-grad / full-time role{s}",
-                                        by_tier["ft"], 0x95A5A6, watch)
+        for tier, route_tier, label, color in (
+            ("intern", "intern", "🛠️ {n} new internship{s}", 0x5865F2),
+            ("ft", "full_time", "💼 {n} new-grad / full-time role{s}", 0x95A5A6),
+        ):
+            if by_tier[tier] and sub.get("discord_configured", True):
+                send_discord_feed("", label, by_tier[tier], color, sub.get("watch"),
+                    enqueue=lambda payload, route_tier=route_tier: _enqueue(con, sub["name"], "feed:" + route_tier, payload))
         if sub["telegram_chat"]:
-            everything = by_tier["intern"] + by_tier["ft"]
-            ok &= send_telegram(sub["telegram_chat"], _telegram_text(everything))
-        if ok:
-            con.execute("DELETE FROM pending WHERE sub=?", (sub["name"],))
-            log(f"  -> {sub['name']}: flushed {len(rows)} queued feed job(s)")
+            send_telegram(sub["telegram_chat"], _telegram_text(by_tier["intern"] + by_tier["ft"]),
+                enqueue=lambda payload: _enqueue(con, sub["name"], "telegram", payload))
+        con.execute("DELETE FROM pending WHERE sub=?", (sub["name"],))
+        log(f"  -> {sub['name']}: queued {len(rows)} feed job(s) for delivery")
 
 
 def maybe_digest(config, con, subs):
@@ -1190,7 +1345,8 @@ def maybe_digest(config, con, subs):
     n_boards = con.execute(
         "SELECT COUNT(*) FROM boards WHERE seeded=1").fetchone()[0]
     broken = [b for (b,) in con.execute(
-        "SELECT board FROM boards WHERE failures >= 10 ORDER BY board")]
+        "SELECT board FROM boards WHERE failures >= 10 ORDER BY board")
+              if b in config["boards"] and not config["boards"][b].get("disabled")]
 
     if rows:
         top = "\n".join(f"• **{c}** — {n}" for c, n in rows[:10])
@@ -1217,7 +1373,19 @@ def maybe_digest(config, con, subs):
 
 
 # ================================================================ core cycle
+_HOST_LOCKS = {}
+_HOST_LOCKS_GUARD = threading.Lock()
+
+
 def fetch_board(name, cfg):
+    host = cfg.get("host") or ("linkedin.com" if cfg["ats"] == "linkedin" else name)
+    with _HOST_LOCKS_GUARD:
+        lock = _HOST_LOCKS.setdefault(host, threading.Lock())
+    with lock:
+        return _fetch_board(name, cfg)
+
+
+def _fetch_board(name, cfg):
     for attempt in range(2):
         try:
             jobs = ADAPTERS[cfg["ats"]](cfg)
@@ -1228,12 +1396,36 @@ def fetch_board(name, cfg):
             time.sleep(0.75)
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else 0
-            if attempt or (status != 429 and status < 500):
+            if attempt or status == 429 or status < 500:
                 raise
             time.sleep(0.75)
+    result = FetchResult(warnings=getattr(jobs, "warnings", ()))
+    seen = set()
     for j in jobs:
-        j.setdefault("company", name.replace("_", " "))
-    return name, jobs
+        if (not isinstance(j, dict) or j.get("id") in (None, "", "None")
+                or not isinstance(j.get("title"), str) or not j["title"].strip()
+                or not isinstance(j.get("url"), str)
+                or urlsplit(j["url"]).scheme not in ("http", "https")):
+            result.warnings.append("invalid posting omitted (missing ID, title or apply URL)")
+            continue
+        j["id"] = str(j["id"])
+        j["location"] = j.get("location") or ""
+        j["company"] = j.get("company") or cfg.get("company") or name.replace("_", " ")
+        if j["id"] not in seen:
+            seen.add(j["id"])
+            result.append(j)
+    return name, result
+
+
+def _record_failure(con, name, cfg, failures, error, broke, retry_after=0, backoff=True):
+    failures += 1
+    delay = max(retry_after, min(21600, max(60, cfg.get("min_interval", 0)) * (2 ** min(failures - 1, 8) if backoff else 1)))
+    con.execute("UPDATE boards SET failures=?, last_error=?, next_poll=? WHERE board=?",
+                (failures, error[:1000], time.time() + delay, name))
+    if failures == 10:
+        broke.append((name, error[:180]))
+    if failures in (1, 3, 10) or failures % 50 == 0:
+        log(f"! {name}: {error[:300]} (streak {failures}; retry in {int(delay)}s)")
 
 
 def cycle(config, con):
@@ -1251,36 +1443,43 @@ def cycle(config, con):
     due = {}
     for name, cfg in all_boards.items():
         _, _, last_poll = board_row(con, name)
-        if time.time() - last_poll < cfg.get("min_interval", 0):
+        next_poll = con.execute("SELECT next_poll FROM boards WHERE board=?", (name,)).fetchone()[0]
+        if time.time() < (next_poll or 0) or time.time() - last_poll < cfg.get("min_interval", 0):
             skipped += 1
             continue
         due[name] = cfg
 
+    con.commit()  # Do not hold a SQLite write lock while waiting on remote boards.
     with ThreadPoolExecutor(max_workers=10) as ex:
         futs = {ex.submit(fetch_board, n, c): n for n, c in due.items()}
-        for fut in as_completed(futs):
-            name = futs[fut]
+        completed = [(futs[fut], fut) for fut in as_completed(futs)]
+        for name, fut in completed:
             seeded, failures, _ = board_row(con, name)
             con.execute("UPDATE boards SET last_poll=? WHERE board=?",
                         (time.time(), name))
             try:
                 _, jobs = fut.result()
             except Exception as e:
-                failures += 1
-                con.execute("UPDATE boards SET failures=? WHERE board=?", (failures, name))
+                retry_after = _retry_delay(getattr(e, "response", None), 0)
+                _record_failure(con, name, due[name], failures,
+                                f"{type(e).__name__}: {e}", broke, retry_after)
                 fail_count += 1
-                if failures == 10:      # persisted streak → fires once per outage
-                    broke.append((name, type(e).__name__))
-                if failures in (1, 3, 10) or failures % 50 == 0:
-                    log(f"! {name}: {type(e).__name__}: {e} (streak {failures})")
                 continue
 
-            ok_count += 1
             known = known_ids(con, name)
-
+            warnings = list(getattr(jobs, "warnings", ()))
             if not jobs and len(known) >= ZERO_GUARD_MIN:
-                log(f"! {name}: returned 0 jobs but {len(known)} known — ignoring read")
-                continue
+                warnings.append(f"returned 0 jobs with {len(known)} known; read ignored")
+            con.execute("UPDATE boards SET last_count=? WHERE board=?", (len(jobs), name))
+            if warnings:
+                _record_failure(con, name, due[name], failures, "; ".join(dict.fromkeys(warnings)), broke, backoff=not bool(jobs))
+                fail_count += 1
+                if not jobs:
+                    continue
+            else:
+                ok_count += 1
+                con.execute("UPDATE boards SET failures=0, last_ok=?, last_error='', next_poll=0 WHERE board=?",
+                            (now(), name))
 
             fresh = [j for j in jobs if j["id"] and j["id"] not in known]
             ts = now()
@@ -1302,8 +1501,7 @@ def cycle(config, con):
                 [(name, j["id"], j.get("company") or name.replace("_", " "),
                   j.get("salary") or "", _posted_epoch(j.get("posted")))
                  for j in jobs])
-            con.execute("UPDATE boards SET failures=0, last_ok=?, seeded=1 WHERE board=?",
-                        (ts, name))
+            con.execute("UPDATE boards SET seeded=1 WHERE board=?", (name,))
 
             if not seeded:
                 log(f"  {name}: seeded {len(jobs)} postings silently")
@@ -1318,7 +1516,7 @@ def cycle(config, con):
     # direct boards first so when LinkedIn and the company's own ATS surface
     # the same job in one cycle, the alert carries the direct apply link
     ordered = sorted(new_by_board.items(),
-                     key=lambda kv: all_boards.get(kv[0], {}).get("ats") == "linkedin")
+                     key=lambda kv: (all_boards[kv[0]]["ats"] in {"linkedin", "github_md", "github_listings"}, kv[0]))
     for board, jobs in ordered:
         keep = []
         for j in jobs:
@@ -1327,9 +1525,11 @@ def cycle(config, con):
                 agencies += 1       # staffing-agency spam: drop, don't alert
                 continue
             ks = dedupe_keys(j)
-            if already_alerted(con, j) or any(k in seen_keys for k in ks):
+            if already_alerted(con, j):
                 deduped += 1
                 continue
+            if any(k in seen_keys for k in ks):
+                deduped += 1
             seen_keys.update(ks)
             keep.append(j)
         if keep:
@@ -1337,18 +1537,21 @@ def cycle(config, con):
 
     # ---- fanout
     delivered = 0
-    alerted_jobs = set()
     for sub in subs:
         mine = []
+        subscriber_seen = set()
         for board, jobs in gated.items():
             if "all" not in sub["companies"] and board not in sub["companies"]:
                 continue
-            mine.extend((board, j) for j in jobs if sub["filt"].ok(j))
+            for j in jobs:
+                keys = dedupe_keys(j)
+                if sub["filt"].ok(j) and not any(k in subscriber_seen for k in keys):
+                    mine.append((board, j))
+                    subscriber_seen.update(keys)
         if mine:
             mine.sort(key=lambda t: (t[1].get("company", ""), t[1]["title"]))
             deliver(sub, mine, con)
             delivered += len(mine)
-            alerted_jobs.update(id(j) for _, j in mine)
             log(f"  -> {sub['name']}: {len(mine)} job(s)")
 
     # mark every gated job as alerted (even if no subscriber matched, so a
@@ -1356,6 +1559,8 @@ def cycle(config, con):
     ts = now()
     for board, jobs in gated.items():
         for j in jobs:
+            if already_alerted(con, j):
+                continue
             mark_alerted(con, j)
             con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                         (ts, j.get("company") or board.replace("_", " "),
@@ -1363,6 +1568,7 @@ def cycle(config, con):
                          j.get("salary") or ""))
 
     flush_feeds(config, con, subs)
+    flush_outbox(con, subs, checkpoint=lambda: export_state(con))
 
     if broke:
         detail = ", ".join(f"{n} ({err})" for n, err in broke)
@@ -1371,7 +1577,8 @@ def cycle(config, con):
                 send_discord_note(
                     sub["discord"], "⚠️ jobwatch: board trouble",
                     f"{len(broke)} board(s) failing 10 polls in a row: {detail}\n"
-                    f"Check the token / run `python watcher.py --verify`.",
+                    f"Coverage is incomplete; recovered postings are still retained. "
+                    f"Check Sources or run `python watcher.py --verify`.",
                     0xE74C3C)
 
     maybe_digest(config, con, subs)
@@ -1385,7 +1592,8 @@ def cycle(config, con):
                 (f"-{PRUNE_AFTER_DAYS} days",))
     con.execute("DELETE FROM recent WHERE ts < datetime('now', ?)",
                 (f"-{RECENT_DAYS} days",))
-    con.execute("DELETE FROM pending WHERE ts < datetime('now', '-7 days')")
+    # Unsent notifications are retained until acknowledged, never age-pruned.
+    con.execute("DELETE FROM sends WHERE ts < datetime('now', '-90 days')")
     duration = time.time() - t0
     con.execute(
         "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1432,6 +1640,29 @@ def cmd_check(config):
         if b.get("ats") not in ADAPTERS:
             print(f"✗ board {name}: unknown ats {b.get('ats')}")
             errs += 1
+    required = {
+        "greenhouse": ("token",), "lever": ("token",), "ashby": ("token",),
+        "smartrecruiters": ("token",), "workday": ("host", "tenant", "site"),
+        "eightfold": ("host", "domain"), "phenom": ("host",),
+        "github_listings": ("repo",), "github_md": ("repo",),
+    }
+    for name, board in config["boards"].items():
+        if name.startswith("_") or board.get("disabled"):
+            continue
+        for field in required.get(board.get("ats"), ()):
+            if not isinstance(board.get(field), str) or not board[field].strip():
+                print(f"✗ board {name}: {field} must be a nonempty string")
+                errs += 1
+        for field in ("max_pages", "fetch_budget_seconds", "pages", "size", "min_interval"):
+            if field in board and (type(board[field]) is not int or board[field] < (0 if field == "min_interval" else 1)):
+                print(f"✗ board {name}: invalid {field}")
+                errs += 1
+        if board.get("ats") == "github_md":
+            cols = board.get("cols", {})
+            if (not {"company", "title", "url"} <= cols.keys()
+                    or any(type(v) is not int or v < 0 for v in cols.values())):
+                print(f"✗ board {name}: invalid markdown column mapping")
+                errs += 1
     subs = json.loads(SUBSCRIBERS.read_text())
     n_subs = 0
     for name, s in subs.items():
@@ -1476,16 +1707,21 @@ def cmd_verify(config):
             name = futs[fut]
             try:
                 _, jobs = fut.result()
-                print(f"✓ {name:22} {len(jobs):>5} postings")
-                good += 1
+                if jobs.warnings:
+                    print(f"⚠ {name:22} {len(jobs):>5} postings; PARTIAL: {'; '.join(dict.fromkeys(jobs.warnings))[:240]}")
+                    bad += 1
+                else:
+                    print(f"✓ {name:22} {len(jobs):>5} postings")
+                    good += 1
             except Exception as e:
                 print(f"✗ {name:22} {type(e).__name__}: {str(e)[:90]}")
                 bad += 1
     if bad:
-        print(f"\n{good} working, {bad} broken. Fix tokens for broken boards "
-              f"(careers page URL) or set \"disabled\": true.")
+        print(f"\n{good} complete, {bad} failed or partial. Review the errors above; "
+              f"partial reads still retain recovered postings.")
     else:
         print(f"\n{good} working, 0 broken — every enabled source is healthy.")
+    return 1 if bad else 0
 
 
 def cmd_test(config, who):
@@ -1569,8 +1805,7 @@ def main():
     if args.check:
         cmd_check(config)
     if args.verify:
-        cmd_verify(config)
-        return
+        sys.exit(cmd_verify(config))
     if args.test:
         cmd_test(config, args.test)
         return
@@ -1617,6 +1852,7 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as e:
+            con.rollback()
             log(f"! cycle crashed: {type(e).__name__}: {e}")
         time.sleep(max(5, interval) + random.uniform(0, interval * 0.2))
 

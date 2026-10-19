@@ -115,6 +115,19 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertEqual(2, overview["stats"]["searchable_jobs"])
         self.assertEqual("Test search", overview["profile"]["headline"])
 
+    def test_source_health_exposes_error_count_and_retry_time(self):
+        with self.service.db() as con:
+            con.execute("UPDATE boards SET failures=3,last_error='HTTP 429',last_count=42,next_poll=9999999999 WHERE board='demo_startup'")
+        source = next(s for s in self.service.sources()['sources'] if s['name'] == 'demo_startup')
+        self.assertEqual('HTTP 429', source['last_error'])
+        self.assertEqual(42, source['last_count'])
+        self.assertEqual(9999999999, source['next_poll'])
+
+    def test_disabled_and_removed_boards_do_not_inflate_healthy_count(self):
+        with self.service.db() as con:
+            con.execute("INSERT INTO boards(board,seeded) VALUES ('removed',1)")
+        self.assertEqual(1, self.service.overview()['stats']['healthy_sources'])
+
     def test_application_pipeline_round_trip(self):
         job = self.service.jobs({})["jobs"][0]
         result = self.service.save_application({

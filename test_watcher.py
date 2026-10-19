@@ -74,7 +74,7 @@ class PortableStateTests(unittest.TestCase):
 
         watcher.export_state(source)
         exported = json.loads(self.state_path.read_text())
-        self.assertEqual(2, exported["version"])
+        self.assertEqual(3, exported["version"])
 
         restored = self.database()
         watcher.import_state(restored)

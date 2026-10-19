@@ -3,7 +3,7 @@
 Your private career command center: broad job-market coverage, focused daily
 ranking, fast alerts, and a lightweight application CRM.
 
-Jobwatch continuously checks **195 enabled sources** across company ATSs,
+Jobwatch continuously checks **196 enabled sources** across company ATSs,
 startup boards, quant firms, banks, big tech, LinkedIn, and community listing
 repos. It indexes every role it sees, ranks each one against a transparent
 profile, and only interrupts you for the matches that meet your notification
@@ -94,12 +94,14 @@ or alert behavior:
 |---|---|
 | Greenhouse, Lever, Ashby, SmartRecruiters | Direct company boards, including a large startup/AI/fintech set. Ashby includes compensation where published. |
 | Workday, Phenom, Eightfold | Banks, NVIDIA, Salesforce, Adobe, Capital One, Intel, PayPal, Mastercard, Disney, Netflix, and others. |
-| Bespoke adapters | Amazon, Microsoft, and Jane Street. |
-| LinkedIn guest search | Fresh U.S. and Canadian searches without a login, with repost filtering. |
+| Bespoke adapters | Amazon, Jane Street, Hightouch, and Marqeta. The legacy Microsoft endpoint remains disabled; community feeds cover Microsoft. |
+| LinkedIn guest search | U.S. and Canadian searches without a login, newest first with a seven-day overlap. Page limits and query failures are reported. |
 | GitHub listing repos | Simplify, New Grad, internship, off-season, Canada, and salary-aware lists covering bespoke ATSs and long-tail companies. |
 
 Cross-source deduplication prefers direct apply links and remembers alerts for
-90 days. Staffing-agency patterns are excluded before alert fanout.
+90 days. It preserves job IDs in URL query parameters and keeps distinct
+requisitions even when their company and title match. LinkedIn may therefore
+show a duplicate when its public URL cannot be matched to a direct posting. Staffing-agency patterns are excluded before alert fanout.
 
 ## Notifications
 
@@ -158,11 +160,46 @@ their source set and filters, and configure their own delivery secret.
 ## Automation and storage
 
 `.github/workflows/jobwatch.yml` runs tests and configuration validation,
-restores the portable state, polls repeatedly for roughly 25 minutes, and
-chains a successor run. `state.json` on the force-pushed `state` branch keeps
+restores the portable state, polls within a 22-minute deadline, and chains a
+successor run. Failed state downloads stop the run instead of silently starting
+fresh. State pushes retry and fail visibly; failed runs retain a recovery
+snapshot for seven days. `.github/workflows/ci.yml` tests pushes and pull requests
+on Python 3.11, 3.12, and 3.13. `state.json` on the force-pushed `state` branch keeps
 deduplication and alert queues durable across ephemeral runners.
 
 Local SQLite stores richer searchable job metadata, run history, and the
 application pipeline. Portable state deliberately excludes private pipeline
 notes. The project has one runtime dependency (`requests`); the dashboard uses
 Python's standard-library HTTP server and plain HTML/CSS/JavaScript.
+
+## Coverage and recovery
+
+Paginated APIs (Workday, SmartRecruiters, Amazon, Phenom, and Eightfold) are read
+until their reported total or the end of the feed. Workday no longer stops at
+300 postings and the other APIs no longer stop at 100. A source has a default
+180-second fetch budget and 1,000-page safety limit, configurable with
+`fetch_budget_seconds` and `max_pages`. Repeated pages, early empty pages, page
+limits, malformed rows, and later-page failures are reported as incomplete;
+postings recovered before a failure are still indexed. Large or blocked boards
+can remain partial: this does not guarantee exhaustive market coverage.
+
+Source requests retry transient errors, honor short `Retry-After` delays, and
+serialize requests to shared Workday tenants and LinkedIn. Failed boards back
+off up to six hours. Partial reads containing jobs keep their regular polling
+cadence. The Sources view shows the last error, recovered posting count, and
+retry time. `--verify` is read-only and exits nonzero for failed or partial reads.
+Markdown tables follow named columns and retain multiple apply links per row.
+
+Job notifications use a durable per-message outbox. Each Discord/Telegram
+message is acknowledged separately, so a failed loud alert is retried and a
+successful feed chunk is not resent just because another chunk failed. Missing
+secrets leave messages queued. Pending messages do not expire automatically.
+Portable state version 3 includes the outbox and source-health details, reads
+older state versions, and excludes webhook URLs, bot tokens, and application
+notes. The first successful read of a new source still seeds silently.
+
+Delivery is at least once: if a provider accepts a message but its response is
+lost, or the runner stops before its latest checkpoint is uploaded, a retry can
+produce a duplicate. Source-health notices and daily summaries remain best-effort.
+The daily dashboard and the CI runner each use their own local SQLite database;
+GitHub's portable state is notification continuity, not a hosted dashboard.
