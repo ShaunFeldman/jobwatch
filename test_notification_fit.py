@@ -124,6 +124,14 @@ class FitDeliveryTests(unittest.TestCase):
         self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
 
+    def test_preference_change_filters_old_important_queue(self):
+        watcher._enqueue(self.con, 'test', 'ping:intern', {'embeds': [{
+            'title': 'CIBC — Investment Banking Intern', 'description': '📍 Toronto'}]}, time.time()+3600)
+        with patch('watcher.requests.post') as post:
+            watcher.flush_outbox(self.con, [self.sub])
+        post.assert_not_called()
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+
 
 if __name__ == '__main__':
     unittest.main()

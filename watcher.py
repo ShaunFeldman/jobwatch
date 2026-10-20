@@ -1286,7 +1286,8 @@ def deliver(sub, jobs, con):
             # A separate queue item per job gives each its own expiry; no truncation.
             send_discord_ping("", [(board, job)], "internship" if cat == "intern" else "role",
                 mention=sub["mention"], enqueue=lambda payload: _enqueue(
-                    con, sub["name"], ping_route, payload, expiry))
+                    con, sub["name"], ping_route, dict(payload, _fit_job={
+                        k: job.get(k, "") for k in ("title", "company", "location")}), expiry))
             _mark_route(con, sub["name"], ping_route, job)
     return queued
 
@@ -1339,6 +1340,31 @@ def flush_outbox(con, subs, checkpoint=None, budget_seconds=10, max_messages=8):
         if not sub or (name, route) in blocked:
             continue
         payload = json.loads(encoded)
+        fit_job = payload.pop("_fit_job", None)
+        if route.startswith("ping:") and sub.get("notification_fit"):
+            if fit_job and not notification_match(sub, fit_job)["ping"]:
+                con.execute("DELETE FROM outbox WHERE id=?", (key,))
+                con.commit()
+                continue
+            if not fit_job and payload.get("embeds"):
+                # Pre-policy queues contain rendered cards. Recheck those too,
+                # rather than delivering unwanted bank pings after the upgrade.
+                kept = []
+                for embed in payload["embeds"]:
+                    company, separator, title = embed.get("title", "").partition(" — ")
+                    location = next((line[2:].strip() for line in embed.get("description", "").splitlines()
+                                     if line.startswith("📍")), "")
+                    if not separator or notification_match(sub, {
+                            "company": company, "title": title, "location": location})["ping"]:
+                        kept.append(embed)
+                if not kept:
+                    con.execute("DELETE FROM outbox WHERE id=?", (key,))
+                    con.commit()
+                    continue
+                if len(kept) != len(payload["embeds"]):
+                    payload["embeds"] = kept
+                    payload["content"] = (sub.get("mention", "") + "\n" +
+                        "\n".join("🎯 " + e.get("title", "") for e in kept))[:2000]
         if route == "telegram":
             token = os.environ.get("TELEGRAM_BOT_TOKEN")
             if not token or not sub["telegram_chat"]:
