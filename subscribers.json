@@ -26,7 +26,7 @@
     "discord_webhook": "env:DISCORD_WEBHOOK_FULLTIME",
     "telegram_chat_id": "",
     "notification_fit": {
-      "version": 1,
+      "version": 2,
       "threshold": 75,
       "priority_companies": "\\b(netflix|palantir|pinterest|citadel(?: securities)?|jane street|hudson river|hrt|jump trading|two sigma|optiver|imc|drw|five rings|point72|d\\.?\\s*e\\.?\\s*shaw|susquehanna|sig|xtx|google|deepmind|meta|apple|amazon|aws|microsoft|nvidia|databricks|snowflake|stripe|bloomberg|openai|anthropic|ramp|figma|vercel|coinbase|brookfield|blackstone|goldman sachs|morgan stanley|jpmorgan|jp morgan)\\b",
       "selective_companies": "\\b(cibc|canadian imperial bank|rbc|royal bank|bmo|bank of montreal|scotiabank|td bank|td securities|toronto.dominion)\\b"

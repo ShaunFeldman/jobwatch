@@ -33,12 +33,12 @@ class FitTests(unittest.TestCase):
             ('Investment Analyst Intern', 'Citadel', 'New York, NY', True),
             ('Investment Banking Intern', 'Citadel', 'New York, NY', True),
             ('Quantitative Research Intern', 'Citadel', 'Chicago, IL', True),
-            ('Software Engineer Intern', 'CIBC', 'Toronto, ON', False),
+            ('Software Engineer Intern', 'CIBC', 'Toronto, ON', True),
             ('Software Engineer Intern', 'CIBC', 'New York, NY', True),
             ('Backend Engineer Intern', 'New Startup', 'San Francisco, CA', True),
             ('Backend Engineer Intern', 'New Startup', 'Austin, TX', True),
             ('Software Engineer Intern', 'Palantir', 'London, UK (Remote)', False),
-            ('Recruiting Intern', 'Netflix', 'San Francisco, CA', False),
+            ('Recruiting Intern', 'Netflix', 'San Francisco, CA', True),
             ('Senior Software Engineer', 'Netflix', 'New York, NY', False),
             ('Software Engineer L5', 'Netflix', 'New York, NY', False),
             ('Software Engineer II', 'Netflix', 'New York, NY', False),
@@ -50,6 +50,28 @@ class FitTests(unittest.TestCase):
                 result = assess(job(title, company, location), POLICY, WATCH)
                 self.assertEqual(expected, result['ping'])
                 self.assertTrue(result['reasons'])
+
+    def test_company_role_and_location_tradeoffs_generalize(self):
+        cases = [
+            ('Capital Markets Quantitative Analyst', 'CIBC', 'Toronto', True),
+            ('Quantitative Research Intern', 'RBC', 'Toronto', True),
+            ('Machine Learning Intern', 'BMO', 'Toronto', True),
+            ('Backend Engineer Intern', 'Unknown Startup', 'Toronto', True),
+            ('Investment Banking Intern', 'CIBC', 'Toronto', False),
+            ('Business Operations Intern', 'Citadel', 'Toronto', True),
+            ('Business Operations Intern', 'CIBC', 'Toronto', False),
+            ('Strategy Intern', 'Jane Street', 'New York, NY', True),
+            ('Product Management Intern', 'Google', 'San Francisco, CA', True),
+            ('Marketing Intern', 'Citadel', 'New York, NY', True),
+            ('Marketing Intern', 'Unknown Company', 'Toronto', False),
+            ('Software Engineer', 'Unknown Company', 'San Francisco, CA', True),
+            ('Software Engineer', 'Unknown Company', 'Toronto', False),
+            ('Legal Counsel', 'Citadel', 'New York, NY', False),
+            ('Senior Business Operations Analyst', 'Citadel', 'New York, NY', False),
+        ]
+        for title, company, location, expected in cases:
+            with self.subTest(title=title, company=company, location=location):
+                self.assertEqual(expected, assess(job(title, company, location), POLICY, WATCH)['ping'])
 
     def test_bank_finance_remains_in_full_feed(self):
         result = assess(job('Investment Banking Intern', 'CIBC', 'Toronto'), POLICY, WATCH)

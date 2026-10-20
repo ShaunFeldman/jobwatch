@@ -17,11 +17,13 @@ them compelling. NYC/SF receive the strongest location preference, followed by
 other U.S. locations and Canada. A bare "remote" does not make a foreign-only
 role eligible. Unknown locations are explicitly labeled in the match reasons.
 
-Priority tech/trading/investment firms get a company bonus. Routine finance at
-Canadian banks stays in the quiet feeds; relevant U.S. technical internships
-at those banks can still qualify. Generic technical titles no longer require
+Company, role, and location compensate for one another. Exceptional firms can
+justify broader early-career business, product, operations, recruiting, or
+marketing opportunities. At more selective employers, strong quant, software,
+and ML work can qualify even in Canada; routine finance needs a stronger reason
+to interrupt. There is no blanket bank penalty or bank-wide exclusion. Generic technical titles no longer require
 "intern" or "new grad" to reach important full-time alerts. Clearly senior,
-unrelated, or PhD-specific titles are excluded. Each important card explains
+specialist-profession, or PhD-specific titles are excluded. Each important card explains
 why it matched. This is interest matching from titles and locations, not a
 claim that work authorization, graduation windows, or experience requirements
 have been verified.
