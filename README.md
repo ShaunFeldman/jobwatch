@@ -10,10 +10,28 @@ checks your role/location preferences, and sends important matches quickly.
 | All internships | Every newly discovered matching internship; silent messages |
 | All full-time | Every newly discovered matching full-time job; silent messages |
 
-The existing `ping_categories` remain `intern` and `new_grad`: a generic role
-that passes your filters can still appear in a full feed without an important
-ping. Location, role, and company preferences live in `subscribers.json` and
-`config.json`. Nothing is submitted to employers automatically.
+Shaun's alerts use a personal interest policy in `subscribers.json` under
+`notification_fit`. Software/backend, ML/data, and quant roles lead; investing
+and selected technical/business roles qualify when company and location make
+them compelling. NYC/SF receive the strongest location preference, followed by
+other U.S. locations and Canada. A bare "remote" does not make a foreign-only
+role eligible. Unknown locations are explicitly labeled in the match reasons.
+
+Priority tech/trading/investment firms get a company bonus. Routine finance at
+Canadian banks stays in the quiet feeds; relevant U.S. technical internships
+at those banks can still qualify. Generic technical titles no longer require
+"intern" or "new grad" to reach important full-time alerts. Clearly senior,
+unrelated, or PhD-specific titles are excluded. Each important card explains
+why it matched. This is interest matching from titles and locations, not a
+claim that work authorization, graduation windows, or experience requirements
+have been verified.
+
+The policy overrides the older title/location regex gates for Shaun; subscribers
+without it retain their existing filters/watchlists/categories. Employer agency
+exclusions and freshness rules still apply. Changing policy rechecks known
+**official postings within 24 hours** once per source; old and undated records
+are not replayed. First-source baselines remain silent. The resume itself and
+contact details are not stored in this repository.
 
 ## Freshness and completeness
 

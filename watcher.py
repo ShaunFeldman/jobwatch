@@ -42,6 +42,8 @@ import threading
 
 import requests
 
+from notification_fit import assess as assess_notification
+
 HERE = Path(__file__).parent
 DB_PATH = HERE / "jobwatch.db"
 CONFIG = HERE / "config.json"
@@ -949,6 +951,7 @@ def load_subscribers(global_filters):
             continue
         out.append({
             "name": name,
+            "notification_fit": s.get("notification_fit"),
             "companies": set(s.get("companies", ["all"])),
             "filt": Filt(s.get("filters", {}), fallback=global_filters),
             "watch": Filt._c(s.get("watchlist", "")),
@@ -1076,6 +1079,8 @@ def send_discord_ping(webhook, jobs, kind, mention="", omitted=0, enqueue=None):
             parts.append(f"🕒 {age}")
         if j.get("_freshness_note"):
             parts.append(j["_freshness_note"])
+        if j.get("_fit_note"):
+            parts.append("Why: " + j["_fit_note"])
         sal = (j.get("salary") or "").strip()
         if sal:
             parts.append(f"💰 {sal[:60]}")
@@ -1245,10 +1250,24 @@ def _mark_route(con, sub, route, job):
         [(f"route:{sub}:{route}:{key}", now()) for key in dedupe_keys(job)])
 
 
+def notification_match(sub, job):
+    policy = sub.get("notification_fit")
+    if policy:
+        return assess_notification(job, policy, sub.get("watch"))
+    return {"feed": sub.get("filt", Filt({})).ok(job),
+            "ping": bool(sub.get("watch") and sub["watch"].search(job.get("company") or "")
+                         and _category(job["title"]) in sub["ping_categories"]),
+            "reasons": []}
+
+
 def deliver(sub, jobs, con):
     """Queue each eligible channel independently, atomically with its dedupe keys."""
     queued = 0
     for board, job in jobs:
+        fit = notification_match(sub, job)
+        if not fit["feed"]:
+            continue
+        job = dict(job, _fit_note=" · ".join(fit["reasons"]))
         cat = _category(job["title"])
         tier = "intern" if cat == "intern" else "full_time"
         feed_route = f"feed:{tier}"
@@ -1262,9 +1281,7 @@ def deliver(sub, jobs, con):
             queued += 1
         expiry = job.get("_alert_expires_at")
         ping_route = f"ping:{tier}"
-        if (expiry and expiry > time.time() and sub.get("watch")
-                and sub["watch"].search(job.get("company") or board)
-                and cat in sub["ping_categories"]
+        if (expiry and expiry > time.time() and fit["ping"]
                 and not _route_seen(con, sub["name"], ping_route, job)):
             # A separate queue item per job gives each its own expiry; no truncation.
             send_discord_ping("", [(board, job)], "internship" if cat == "intern" else "role",
@@ -1549,7 +1566,7 @@ def remember_publication(con, jobs, cfg, subs):
     URL matching is intentionally conservative, not company/title guessing.
     """
     for job in jobs:
-        if not any(sub["filt"].ok(job) for sub in subs):
+        if not any(notification_match(sub, job)["feed"] for sub in subs):
             continue
         key = "publication:" + canon_url(job["url"])
         saved = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
@@ -1754,6 +1771,7 @@ def cycle(config, con, run_seconds=0):
 
         remember_publication(con, jobs, due[name], subs)
         fresh = [j for j in jobs if j["id"] and j["id"] not in known]
+        fresh_ids = {j["id"] for j in fresh}
         for j in fresh:
             expiry, note = alert_freshness(j, due[name], baseline, freshness_settings, time.time())
             j["_alert_expires_at"] = expiry
@@ -1787,10 +1805,27 @@ def cycle(config, con, run_seconds=0):
             con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (signature_key, _collection_signature(due[name])))
         if not seeded or changed:
             log(f"  {name}: seeded {len(jobs)} postings silently")
-        elif fresh:
+        elif seeded:
             total_new += len(fresh)
+            # A preference update may recover a missed fresh official posting,
+            # but must not replay historical or undated baseline jobs.
+            catchup = {}
+            for sub in subs:
+                policy = sub.get("notification_fit")
+                if policy:
+                    key = f"fit_policy:{sub['name']}:{name}"
+                    signature = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+                    saved = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+                    catchup[sub["name"]] = not saved or saved[0] != signature
             keep = []
-            for job in fresh:
+            for job in jobs:
+                if job["id"] not in fresh_ids:
+                    posted = _posted_epoch(job.get("posted"))
+                    if (not any(catchup.values()) or due[name]["ats"] in DISCOVERY_ONLY_ATS
+                            or not posted or not 0 <= time.time() - posted < freshness_settings.get("max_age_hours", 24) * 3600):
+                        continue
+                    job["_alert_expires_at"], job["_freshness_note"] = alert_freshness(
+                        job, due[name], baseline, freshness_settings, time.time())
                 if excl_co and excl_co.search(job.get("company") or ""):
                     agencies += 1
                 else:
@@ -1798,7 +1833,8 @@ def cycle(config, con, run_seconds=0):
             for sub in subs:
                 if "all" not in sub["companies"] and name not in sub["companies"]:
                     continue
-                mine = [(name, job) for job in keep if sub["filt"].ok(job)]
+                mine = [(name, job) for job in keep
+                        if (job["id"] in fresh_ids or catchup.get(sub["name"])) and notification_match(sub, job)["feed"]]
                 queued = deliver(sub, mine, con)
                 delivered += queued
                 deduped += len(mine) - queued
@@ -1806,6 +1842,12 @@ def cycle(config, con, run_seconds=0):
                 con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     (now(), job.get("company") or name, job["title"], job["url"],
                      job.get("location") or "", job.get("salary") or ""))
+        if not warnings:
+            for sub in subs:
+                if sub.get("notification_fit"):
+                    signature = hashlib.sha256(json.dumps(sub["notification_fit"], sort_keys=True).encode()).hexdigest()
+                    con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)",
+                                (f"fit_policy:{sub['name']}:{name}", signature))
         # Commit IDs, per-channel dedupe, and queues together before sending.
         con.commit()
         flush_feeds(config, con, subs)
@@ -1934,6 +1976,16 @@ def cmd_check(config):
             print(f"✗ subscriber {name}: unknown ping categories "
                   f"{', '.join(sorted(invalid))}")
             errs += 1
+        policy = s.get("notification_fit")
+        if policy:
+            try:
+                if not isinstance(policy, dict) or type(policy.get("threshold", 75)) is not int or not 0 <= policy.get("threshold", 75) <= 150:
+                    raise ValueError("invalid threshold")
+                for field in ("priority_companies", "selective_companies"):
+                    re.compile(policy.get(field, r"(?!)"))
+            except (ValueError, TypeError, re.error) as exc:
+                print(f"✗ subscriber {name}: invalid notification_fit: {exc}")
+                errs += 1
         if not s.get("discord_webhook") and not s.get("telegram_chat_id"):
             print(f"⚠ subscriber {name}: no delivery channel configured")
     n_boards = sum(1 for k in config["boards"] if not k.startswith("_"))
