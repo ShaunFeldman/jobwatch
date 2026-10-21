@@ -13,8 +13,11 @@ checks your role/location preferences, and sends important matches quickly.
 Shaun's alerts use a personal interest policy in `subscribers.json` under
 `notification_fit`. Software/backend, ML/data, and quant roles lead; investing
 and selected technical/business roles qualify when company and location make
-them compelling. NYC/SF receive the strongest location preference, followed by
-other U.S. locations and Canada. A bare "remote" does not make a foreign-only
+them compelling. Important alerts require NYC, the SF Bay Area, or Toronto for ordinary employers.
+Other US/Canadian cities and unconfirmed locations require an employer in the
+explicit `location_exception_companies` list (the approved exceptional tech/trading
+firms); watchlist membership alone is insufficient. Full feeds retain other
+matching US/Canadian discoveries. A bare "remote" does not make a foreign-only
 role eligible. Unknown locations are explicitly labeled in the match reasons.
 
 Company, role, and location compensate for one another. Exceptional firms can
@@ -30,8 +33,9 @@ have been verified.
 
 The policy overrides the older title/location regex gates for Shaun; subscribers
 without it retain their existing filters/watchlists/categories. Employer agency
-exclusions and freshness rules still apply. Changing policy rechecks known
-**official postings within 24 hours** once per source; old and undated records
+exclusions and freshness rules still apply. Policy changes can optionally recheck known
+**official postings within 24 hours** once per source. This subscriber disables
+that replay with `replay_on_change: false` to avoid upgrade floods; old and undated records
 are not replayed. First-source baselines remain silent. The resume itself and
 contact details are not stored in this repository.
 

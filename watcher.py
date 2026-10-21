@@ -1842,7 +1842,7 @@ def cycle(config, con, run_seconds=0):
                     key = f"fit_policy:{sub['name']}:{name}"
                     signature = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
                     saved = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
-                    catchup[sub["name"]] = not saved or saved[0] != signature
+                    catchup[sub["name"]] = policy.get("replay_on_change", True) and (not saved or saved[0] != signature)
             keep = []
             for job in jobs:
                 if job["id"] not in fresh_ids:
@@ -2007,7 +2007,9 @@ def cmd_check(config):
             try:
                 if not isinstance(policy, dict) or type(policy.get("threshold", 75)) is not int or not 0 <= policy.get("threshold", 75) <= 150:
                     raise ValueError("invalid threshold")
-                for field in ("priority_companies", "selective_companies"):
+                if type(policy.get("replay_on_change", True)) is not bool:
+                    raise ValueError("invalid replay_on_change")
+                for field in ("priority_companies", "selective_companies", "ping_locations", "location_exception_companies"):
                     re.compile(policy.get(field, r"(?!)"))
             except (ValueError, TypeError, re.error) as exc:
                 print(f"✗ subscriber {name}: invalid notification_fit: {exc}")

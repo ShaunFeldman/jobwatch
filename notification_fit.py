@@ -22,8 +22,8 @@ SENIOR = r'\b(senior|sr\.?|staff|principal|lead|director|vice president|vp|head 
 BUSINESS = r'\b(product|program|project|operations|strategy|business|recruit\w*|human resources|hr|marketing|sales|account executive|customer success|client services|communications|commercial)\b'
 SPECIALIST = r'\b(physician|nurse|surgeon|lawyer|attorney|legal counsel|electrician|plumber|mechanic|warehouse|truck driver|animator|animation|graphic designer)\b'
 
-NY_SF = r'\b(new york|nyc|manhattan|brooklyn|jersey city|san francisco|sf|bay area|palo alto|menlo park|mountain view|sunnyvale|redwood city|san jose)\b'
-US = r'\b(united states|us|usa|u\.s\.?a?\.?|seattle|bellevue|redmond|chicago|boston|austin|dallas|houston|los angeles|los gatos|washington|denver|atlanta|miami|san diego|philadelphia|pittsburgh|portland|raleigh|durham|charlotte|arlington|norfolk|laurel|fayetteville|honolulu|boulder|columbus|detroit|minneapolis|nashville|salt lake city|phoenix)\b'
+NY_SF = r'\b(new york|nyc|manhattan|brooklyn|jersey city|san francisco|sf|bay area|palo alto|menlo park|mountain view|sunnyvale|redwood city|san jose|los gatos|san mateo|cupertino|oakland|berkeley)\b'
+US = r'\b(united states|california|us|usa|u\.s\.?a?\.?|seattle|bellevue|redmond|chicago|boston|austin|dallas|houston|los angeles|los gatos|washington|denver|atlanta|miami|san diego|philadelphia|pittsburgh|portland|raleigh|durham|charlotte|arlington|norfolk|laurel|fayetteville|honolulu|boulder|columbus|detroit|minneapolis|nashville|salt lake city|phoenix)\b'
 STATES = r'(?:,\s*|^)(AL|AK|AZ|AR|CA|CO|CT|DE|DC|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)(?:\b|$)'
 CANADA = r'\b(canada|toronto|waterloo|vancouver|montreal|ottawa|calgary|edmonton|ontario|quebec|british columbia)\b'
 
@@ -85,4 +85,14 @@ def assess(job, policy, watch=None):
     if early:
         reasons.append('early-career title')
     ping = score >= policy.get('threshold', 75)
+    # Location is a gate for important alerts, not an additive score bonus.
+    # Keep discovery feeds complete even when a move is not worthwhile.
+    preferred = policy.get('ping_locations')
+    if preferred and not matches(preferred, job.get('location', '')):
+        exceptional = matches(policy.get('location_exception_companies', r'(?!)'), company)
+        if not exceptional:
+            ping = False
+            reasons.append('full feed only: outside preferred ping locations')
+        else:
+            reasons.append('exceptional employer allows broader location')
     return {'feed': True, 'ping': ping, 'score': score, 'reasons': reasons, 'role': role}

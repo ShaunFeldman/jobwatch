@@ -36,7 +36,7 @@ class FitTests(unittest.TestCase):
             ('Software Engineer Intern', 'CIBC', 'Toronto, ON', True),
             ('Software Engineer Intern', 'CIBC', 'New York, NY', True),
             ('Backend Engineer Intern', 'New Startup', 'San Francisco, CA', True),
-            ('Backend Engineer Intern', 'New Startup', 'Austin, TX', True),
+            ('Backend Engineer Intern', 'New Startup', 'Austin, TX', False),
             ('Software Engineer Intern', 'Palantir', 'London, UK (Remote)', False),
             ('Recruiting Intern', 'Netflix', 'San Francisco, CA', True),
             ('Senior Software Engineer', 'Netflix', 'New York, NY', False),
@@ -72,6 +72,21 @@ class FitTests(unittest.TestCase):
         for title, company, location, expected in cases:
             with self.subTest(title=title, company=company, location=location):
                 self.assertEqual(expected, assess(job(title, company, location), POLICY, WATCH)['ping'])
+
+    def test_strict_ping_locations(self):
+        for location in ('Arlington, VA', 'Atlanta, GA', 'Austin, TX', 'Seattle, WA',
+                         'Vancouver, Canada', 'Remote', 'United States', 'California'):
+            with self.subTest(location=location):
+                result = assess(job('Software Engineer Intern', 'Construction Co', location),
+                                POLICY, re.compile('Construction Co'))
+                self.assertFalse(result['ping'])
+                self.assertTrue(result['feed'])
+        for location in ('Toronto, ON', 'New York, NY', 'San Francisco, CA', 'Cupertino, CA'):
+            self.assertTrue(assess(job('Software Engineer Intern', 'New Startup', location), POLICY)['ping'])
+        for company, expected in [('OpenAI', True), ('Jane Street', True), ('Amazon', False),
+                                  ('OpenAI Partner Construction', False), ('CIBC', False)]:
+            self.assertEqual(expected, assess(job('Software Engineer Intern', company, 'Atlanta, GA'), POLICY)['ping'])
+        self.assertFalse(assess(job('Software Engineer Intern', 'OpenAI', 'London, UK'), POLICY)['ping'])
 
     def test_bank_finance_remains_in_full_feed(self):
         result = assess(job('Investment Banking Intern', 'CIBC', 'Toronto'), POLICY, WATCH)
@@ -117,6 +132,7 @@ class FitDeliveryTests(unittest.TestCase):
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
 
     def test_policy_upgrade_recovers_only_recent_known_official_jobs_once(self):
+        self.sub["notification_fit"] = dict(POLICY, replay_on_change=True)
         self.con.execute("INSERT INTO boards(board,seeded) VALUES ('demo',1)")
         rows = [job('Software Engineer', jid='recent', posted=time.time()-60),
                 job('Software Engineer', jid='old', posted=time.time()-864000),
@@ -128,6 +144,33 @@ class FitDeliveryTests(unittest.TestCase):
         self.cycle(rows)
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
         self.assertEqual(['https://example.com/jobs/recent'], [r[0] for r in self.con.execute('SELECT url FROM pending')])
+
+    def test_tightening_policy_does_not_replay_existing_jobs(self):
+        self.con.execute("INSERT INTO boards(board,seeded) VALUES ('demo',1)")
+        row = job('Software Engineer', posted=time.time()-60)
+        self.con.execute('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)',
+                         ('demo', row['id'], row['title'], row['location'], row['url'], watcher.now(), watcher.now()))
+        self.cycle([row])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_nonpreferred_city_only_queues_full_feed(self):
+        self.con.execute("INSERT INTO boards(board,seeded) VALUES ('demo',1)")
+        self.cycle([job('Software Engineer Intern', 'Construction Co', 'Arlington, VA', posted=time.time()-60)])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_already_queued_nonpreferred_city_is_dropped(self):
+        for metadata in (False, True):
+            payload = {'embeds': [{'title': 'Construction Co — Software Engineer Intern',
+                                   'description': '📍 Arlington, VA'}]}
+            if metadata:
+                payload['_fit_job'] = job('Software Engineer Intern', 'Construction Co', 'Arlington, VA')
+            watcher._enqueue(self.con, 'test', 'ping:intern', payload, time.time()+3600)
+            with patch('watcher.requests.post') as post:
+                watcher.flush_outbox(self.con, [self.sub])
+            post.assert_not_called()
+            self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
 
     def test_new_source_baseline_stays_silent_under_fit_policy(self):
         self.cycle([job('Software Engineer', posted=time.time()-60)])
