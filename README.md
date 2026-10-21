@@ -151,3 +151,7 @@ ranking, saved jobs, application notes, and source health. It uses its own
 SQLite data; GitHub's notification state is not a hosted dashboard sync.
 Application notes never enter the public state branch. The server binds to
 loopback and has no authentication; keep it local.
+
+LinkedIn searches are disabled: repost dates do not establish a new opening.
+LinkedIn links are excluded from both Discord tiers, including restored queues;
+official employer postings and community listings with employer links remain enabled.

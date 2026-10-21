@@ -1250,7 +1250,50 @@ def _mark_route(con, sub, route, job):
         [(f"route:{sub}:{route}:{key}", now()) for key in dedupe_keys(job)])
 
 
+def is_linkedin_url(url):
+    try:
+        host = (urlsplit(url or '').hostname or '').lower()
+    except ValueError:
+        return False
+    return host == 'linkedin.com' or host.endswith('.linkedin.com')
+
+
+def strip_linkedin_embeds(payload):
+    """Filter restored Discord queues without discarding official jobs in a batch."""
+    kept = []
+    changed = False
+    for original in payload.get('embeds', []):
+        if is_linkedin_url(original.get('url')):
+            changed = True
+            continue
+        embed = dict(original)
+        blocks = []
+        for block in embed.get('description', '').split('\n\n'):
+            lines = block.split('\n')
+            retained = [line for line in lines if not any(
+                is_linkedin_url(url) for url in re.findall(r'https?://[^\s)<>]+', line))]
+            if retained != lines:
+                changed = True
+                # Quiet-feed blocks consist of a company header and job links.
+                if not any(re.search(r'\]\(https?://', line) for line in retained):
+                    continue
+            blocks.append('\n'.join(retained))
+        embed['description'] = '\n\n'.join(blocks)
+        if original.get('description') and not embed['description']:
+            continue
+        kept.append(embed)
+    if changed:
+        payload['embeds'] = kept
+        payload.pop('content', None)  # Old preview text may name a removed job.
+        for embed in kept:
+            if not embed.get('url'):
+                embed['title'] = 'Job discoveries'  # Original counts no longer apply.
+    return payload
+
+
 def notification_match(sub, job):
+    if is_linkedin_url(job.get("url")):
+        return {"feed": False, "ping": False, "reasons": ["LinkedIn discoveries disabled"]}
     policy = sub.get("notification_fit")
     if policy:
         return assess_notification(job, policy, sub.get("watch"))
@@ -1340,6 +1383,12 @@ def flush_outbox(con, subs, checkpoint=None, budget_seconds=10, max_messages=8):
         if not sub or (name, route) in blocked:
             continue
         payload = json.loads(encoded)
+        if route.startswith(('ping:', 'feed:')) and payload.get('embeds'):
+            payload = strip_linkedin_embeds(payload)
+            if not payload.get('embeds'):
+                con.execute("DELETE FROM outbox WHERE id=?", (key,))
+                con.commit()
+                continue
         fit_job = payload.pop("_fit_job", None)
         if route.startswith("ping:") and sub.get("notification_fit"):
             if fit_job and not notification_match(sub, fit_job)["ping"]:
@@ -1433,6 +1482,8 @@ def flush_feeds(config, con, subs, force=False):
         by_tier = {"intern": [], "ft": []}
         seen = set()
         for tier, ts, company, title, url, location, salary, posted, expires_at, freshness_note in rows:
+            if is_linkedin_url(url):
+                continue
             key = (canon_url(url), company.casefold(), title.casefold())
             if key in seen:     # same job queued twice via near-identical rows
                 continue
