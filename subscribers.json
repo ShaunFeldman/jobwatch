@@ -26,13 +26,14 @@
     "discord_webhook": "env:DISCORD_WEBHOOK_FULLTIME",
     "telegram_chat_id": "",
     "notification_fit": {
-      "version": 3,
+      "version": 4,
       "threshold": 75,
       "priority_companies": "\\b(netflix|palantir|pinterest|citadel(?: securities)?|jane street|hudson river|hrt|jump trading|two sigma|optiver|imc|drw|five rings|point72|d\\.?\\s*e\\.?\\s*shaw|susquehanna|sig|xtx|google|deepmind|meta|apple|amazon|aws|microsoft|nvidia|databricks|snowflake|stripe|bloomberg|openai|anthropic|ramp|figma|vercel|coinbase|brookfield|blackstone|goldman sachs|morgan stanley|jpmorgan|jp morgan)\\b",
       "selective_companies": "\\b(cibc|canadian imperial bank|rbc|royal bank|bmo|bank of montreal|scotiabank|td bank|td securities|toronto.dominion)\\b",
       "replay_on_change": false,
       "ping_locations": "\\b(new york|nyc|manhattan|brooklyn|jersey city|san francisco|sf|bay area|palo alto|menlo park|mountain view|sunnyvale|redwood city|san jose|los gatos|san mateo|cupertino|oakland|berkeley|toronto)\\b",
-      "location_exception_companies": "^(?:citadel(?: securities)?|jane street|hudson river trading|hrt|jump trading|d\\.?\\s*e\\.?\\s*shaw|google|google deepmind|deepmind|meta|meta platforms|apple|netflix|nvidia|openai|anthropic|stripe|databricks|figma|palantir(?: technologies)?)(?:,? inc\\.?)?$"
+      "location_exception_companies": "^(?:citadel(?: securities)?|jane street|hudson river trading|hrt|jump trading|d\\.?\\s*e\\.?\\s*shaw|google|google deepmind|deepmind|meta|meta platforms|apple|netflix|nvidia|openai|anthropic|stripe|databricks|figma|palantir(?: technologies)?)(?:,? inc\\.?)?$",
+      "technical_location_companies": "^(?:docusign|adobe|salesforce|atlassian|microsoft|amazon(?: web services)?|aws|pinterest|shopify|spotify|snap(?: inc\\.?)?|reddit|discord|duolingo|dropbox|twilio|instacart|ebay|linkedin|snowflake|cloudflare|datadog|mongodb|gitlab|airbnb|uber|lyft|doordash|roblox|coinbase|ramp|plaid|robinhood|block|bloomberg|confluent|hashicorp|autodesk|servicenow|workday|hubspot|intuit|cisco|qualcomm|amd|intel)(?:,? (?:inc\\.?|corporation|technologies))?$"
     }
   },
   "friend_example": {

@@ -14,9 +14,11 @@ Shaun's alerts use a personal interest policy in `subscribers.json` under
 `notification_fit`. Software/backend, ML/data, and quant roles lead; investing
 and selected technical/business roles qualify when company and location make
 them compelling. Important alerts require NYC, the SF Bay Area, or Toronto for ordinary employers.
-Other US/Canadian cities and unconfirmed locations require an employer in the
-explicit `location_exception_companies` list (the approved exceptional tech/trading
-firms); watchlist membership alone is insufficient. Full feeds retain other
+For other US/Canadian cities, established tech employers in
+`technical_location_companies` qualify for software, data/ML, quant, and technical
+crossover roles (for example, DocuSign SWE in Chicago). Broader roles and
+unconfirmed locations still require an employer in `location_exception_companies`.
+Watchlist membership alone is insufficient. Full feeds retain other
 matching US/Canadian discoveries. A bare "remote" does not make a foreign-only
 role eligible. Unknown locations are explicitly labeled in the match reasons.
 

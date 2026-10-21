@@ -90,9 +90,16 @@ def assess(job, policy, watch=None):
     preferred = policy.get('ping_locations')
     if preferred and not matches(preferred, job.get('location', '')):
         exceptional = matches(policy.get('location_exception_companies', r'(?!)'), company)
-        if not exceptional:
+        # Established tech employers broaden geography for relevant work, not
+        # for unrelated business roles. Keep this separate from prestige perks.
+        technical_employer = (role in {'software', 'data_ml', 'quant', 'adjacent'}
+                              and region in {'us', 'canada', 'remote'}
+                              and matches(policy.get('technical_location_companies', r'(?!)'), company))
+        if not exceptional and not technical_employer:
             ping = False
             reasons.append('full feed only: outside preferred ping locations')
-        else:
+        elif exceptional:
             reasons.append('exceptional employer allows broader location')
+        else:
+            reasons.append('established tech employer + relevant role allows broader location')
     return {'feed': True, 'ping': ping, 'score': score, 'reasons': reasons, 'role': role}

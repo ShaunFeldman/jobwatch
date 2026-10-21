@@ -2009,7 +2009,7 @@ def cmd_check(config):
                     raise ValueError("invalid threshold")
                 if type(policy.get("replay_on_change", True)) is not bool:
                     raise ValueError("invalid replay_on_change")
-                for field in ("priority_companies", "selective_companies", "ping_locations", "location_exception_companies"):
+                for field in ("priority_companies", "selective_companies", "ping_locations", "location_exception_companies", "technical_location_companies"):
                     re.compile(policy.get(field, r"(?!)"))
             except (ValueError, TypeError, re.error) as exc:
                 print(f"✗ subscriber {name}: invalid notification_fit: {exc}")

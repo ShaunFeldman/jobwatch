@@ -83,10 +83,30 @@ class FitTests(unittest.TestCase):
                 self.assertTrue(result['feed'])
         for location in ('Toronto, ON', 'New York, NY', 'San Francisco, CA', 'Cupertino, CA'):
             self.assertTrue(assess(job('Software Engineer Intern', 'New Startup', location), POLICY)['ping'])
-        for company, expected in [('OpenAI', True), ('Jane Street', True), ('Amazon', False),
+        for company, expected in [('OpenAI', True), ('Jane Street', True), ('Amazon', True),
                                   ('OpenAI Partner Construction', False), ('CIBC', False)]:
             self.assertEqual(expected, assess(job('Software Engineer Intern', company, 'Atlanta, GA'), POLICY)['ping'])
         self.assertFalse(assess(job('Software Engineer Intern', 'OpenAI', 'London, UK'), POLICY)['ping'])
+
+    def test_established_tech_employers_broaden_location_for_relevant_roles(self):
+        cases = [
+            ('Software Engineer Intern', 'DocuSign', 'Chicago, IL', True),
+            ('Software Engineer', 'Docusign, Inc.', 'Chicago, IL', True),
+            ('Data Engineer Intern', 'Adobe', 'Atlanta, GA', True),
+            ('Software Engineer Intern', 'Atlassian', 'Austin, TX', True),
+            ('Software Engineer', 'Salesforce', 'Chicago, IL', True),
+            ('Software Engineer Intern', 'Construction Co', 'Arlington, VA', False),
+            ('Software Engineer Intern', 'Unknown Startup', 'Chicago, IL', False),
+            ('Marketing Intern', 'DocuSign', 'Chicago, IL', False),
+            ('Sales Intern', 'DocuSign', 'Chicago, IL', False),
+            ('Senior Software Engineer', 'DocuSign', 'Chicago, IL', False),
+            ('Software Engineer Intern', 'DocuSign', 'London, UK', False),
+            ('Software Engineer Intern', 'DocuSign', 'Multiple locations', False),
+            ('Software Engineer Intern', 'DocuSign Partner Construction', 'Chicago, IL', False),
+        ]
+        for title, company, location, expected in cases:
+            with self.subTest(title=title, company=company, location=location):
+                self.assertEqual(expected, assess(job(title, company, location), POLICY)['ping'])
 
     def test_bank_finance_remains_in_full_feed(self):
         result = assess(job('Investment Banking Intern', 'CIBC', 'Toronto'), POLICY, WATCH)
@@ -153,6 +173,16 @@ class FitDeliveryTests(unittest.TestCase):
         self.cycle([row])
         self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
         self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_docusign_chicago_reaches_both_intern_channels_once(self):
+        self.con.execute("INSERT INTO boards(board,seeded) VALUES ('demo',1)")
+        rows = [job('Software Engineer Intern', 'DocuSign', 'Chicago, IL', posted=time.time()-60)]
+        self.cycle(rows)
+        self.cycle(rows)
+        routes = self.con.execute('SELECT route,payload FROM outbox').fetchall()
+        self.assertEqual(['ping:intern'], [row[0] for row in routes])
+        self.assertIn('established tech employer', routes[0][1])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
 
     def test_nonpreferred_city_only_queues_full_feed(self):
         self.con.execute("INSERT INTO boards(board,seeded) VALUES ('demo',1)")
