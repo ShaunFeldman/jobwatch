@@ -287,9 +287,9 @@
                             "cols": { "company": 0, "title": 1, "location": 2, "url": 1 },
                             "_note": "|Company|Role|Location|Age| — apply link is embedded in the Role cell, so url col = title col (1); the adapter extracts the md link from it" },
 
-    "_linkedin": "--- LinkedIn searches disabled: reposts are not reliable evidence of new openings. Official boards and employer-linked community listings remain enabled. ---",
-    "linkedin_us":     {"ats": "linkedin", "disabled": true, "location": "United States", "min_interval": 300, "queries": ["software engineer intern", "software engineer new grad", "software developer intern", "2027 software engineer", "machine learning intern"], "recency": "r604800"},
-    "linkedin_canada": {"ats": "linkedin", "disabled": true, "location": "Canada", "min_interval": 600, "queries": ["software engineer intern", "software engineer new grad"], "recency": "r604800"},
-    "linkedin_quant":  {"ats": "linkedin", "disabled": true, "location": "United States", "min_interval": 900, "queries": ["quantitative trading intern", "quantitative research intern", "quantitative trader 2027"], "recency": "r604800"}
+    "_linkedin": "--- LinkedIn guest search: newest first with a seven-day overlap. Query failures and page limits are visible as partial coverage. ---",
+    "linkedin_us":     {"ats": "linkedin", "location": "United States", "min_interval": 300, "queries": ["software engineer intern", "software engineer new grad", "software developer intern", "2027 software engineer", "machine learning intern"], "recency": "r604800"},
+    "linkedin_canada": {"ats": "linkedin", "location": "Canada", "min_interval": 600, "queries": ["software engineer intern", "software engineer new grad"], "recency": "r604800"},
+    "linkedin_quant":  {"ats": "linkedin", "location": "United States", "min_interval": 900, "queries": ["quantitative trading intern", "quantitative research intern", "quantitative trader 2027"], "recency": "r604800"}
   }
 }

@@ -33,7 +33,7 @@ class FreshnessPolicyTests(unittest.TestCase):
         for ats in watcher.DISCOVERY_ONLY_ATS:
             with self.subTest(ats=ats):
                 expiry, reason = watcher.alert_freshness(job(posted=NOW - 60), {'ats': ats}, None, {}, NOW)
-                self.assertGreater(expiry, NOW)
+                self.assertIsNone(expiry)
                 self.assertIn('unverified', reason)
 
     def test_unknown_date_warns_unless_recent_complete_baseline(self):
@@ -132,12 +132,85 @@ class FreshnessIntegrationTests(unittest.TestCase):
 
     def test_discovery_only_echo_does_not_block_company_alert(self):
         self.seed_board()
-        self.run_cycle([job('same', NOW-60)], {'ats': 'linkedin'})
+        self.run_cycle([job('same', NOW-60)], {'ats': 'linkedin', 'min_interval': 0})
         self.assertFalse(watcher.already_alerted(self.con, job('same')))
         self.con.execute("INSERT INTO boards(board,seeded) VALUES ('company',1)")
         with patch('watcher.fetch_board', return_value=('company', watcher.FetchResult([job('same', NOW-60)]))), patch('watcher.flush_outbox'):
             watcher.cycle({'boards': {'company': DIRECT}}, self.con)
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_unverified_linkedin_is_quiet_then_verified_new_job_pings_once(self):
+        self.seed_board()
+        row = dict(job('123', NOW-60), url='https://www.linkedin.com/jobs/view/123')
+        self.run_cycle([row], {'ats': 'linkedin', 'min_interval': 0})
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        verified = dict(row, url='https://example.com/jobs/official', _discovery_url=row['url'],
+                        _official_posted=True, posted=NOW-60)
+        self.run_cycle([verified], {'ats': 'linkedin', 'min_interval': 0})
+        self.run_cycle([dict(verified)], {'ats': 'linkedin', 'min_interval': 0})
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        # Subsequent direct-board discovery is deduplicated in both channels.
+        self.con.execute("INSERT INTO boards(board,seeded) VALUES ('company',1)")
+        with patch('watcher.fetch_board', return_value=('company', watcher.FetchResult([job('official', NOW-60)]))), patch('watcher.flush_outbox'):
+            watcher.cycle({'boards': {'company': DIRECT}}, self.con)
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+
+    def test_verified_baseline_discoveries_stay_silent_on_next_check(self):
+        row = dict(job('baseline', NOW-60), _official_posted=True)
+        self.run_cycle([row], {'ats': 'linkedin', 'min_interval': 0})
+        self.run_cycle([dict(row)], {'ats': 'linkedin', 'min_interval': 0})
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_old_first_observation_survives_refreshed_official_date(self):
+        self.seed_board()
+        row = job('old', None)
+        watcher.remember_publication(self.con, [row], DIRECT, [subscriber()])
+        self.con.execute("UPDATE kv SET v=? WHERE k LIKE 'original_seen:%'", (str(NOW-864000),))
+        repost = dict(job('old', NOW-60), _official_posted=True)
+        watcher.remember_publication(self.con, [repost], {'ats': 'linkedin', 'min_interval': 0}, [subscriber()])
+        expiry, note = watcher.alert_freshness(repost, {'ats': 'linkedin', 'min_interval': 0}, None, {}, NOW)
+        self.assertIsNone(expiry)
+        self.assertIn('previously observed', note)
+
+    def test_verification_cache_and_publication_survive_state_roundtrip(self):
+        self.seed_board()
+        source = 'https://www.linkedin.com/jobs/view/123'
+        row = dict(job('123', NOW-60), _official_posted=True, _discovery_url=source,
+                   _verification={'source_url': source, 'url': 'https://example.com/jobs/123',
+                                  'posted': NOW-60, 'retry_at': NOW+3600})
+        self.run_cycle([row], {'ats': 'linkedin', 'min_interval': 0})
+        watcher.export_state(self.con)
+        restored = watcher.db_open(':memory:')
+        try:
+            watcher.import_state(restored)
+            evidence = restored.execute("SELECT v FROM kv WHERE k=?", ('verification:' + source,)).fetchone()
+            self.assertEqual(NOW-60, json.loads(evidence[0])['posted'])
+            repost = dict(job('123', NOW-1))
+            watcher.remember_publication(restored, [repost], {'ats': 'linkedin'}, [subscriber()])
+            self.assertEqual(NOW-60, repost['posted'])
+        finally:
+            restored.close()
+
+    def test_repost_timestamp_is_not_displayed_as_original_age(self):
+        self.seed_board()
+        self.run_cycle([job('unverified', NOW-60)], {'ats': 'linkedin', 'min_interval': 0})
+        posted, note = self.con.execute('SELECT posted,freshness_note FROM pending').fetchone()
+        self.assertIsNone(posted)
+        self.assertIn('unverified', note)
+
+    def test_legacy_unverified_ping_is_retired_but_quiet_feed_is_kept(self):
+        payload = {'embeds': [{'title': 'Example — Intern',
+                              'url': 'https://www.linkedin.com/jobs/view/123',
+                              'description': 'Age unverified — may be older'}]}
+        watcher._enqueue(self.con, 'test', 'ping:intern', payload, NOW+3600)
+        watcher._enqueue(self.con, 'test', 'feed:intern', payload, 0)
+        with patch('watcher._post_with_retry', return_value=True) as send:
+            watcher.flush_outbox(self.con, [subscriber()])
+        self.assertEqual(1, send.call_count)
 
     def test_expired_and_legacy_messages_never_send(self):
         for expiry in (None, NOW-1, NOW+60):

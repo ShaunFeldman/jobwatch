@@ -43,6 +43,7 @@ import threading
 import requests
 
 from notification_fit import assess as assess_notification
+import discovery_verification
 
 HERE = Path(__file__).parent
 DB_PATH = HERE / "jobwatch.db"
@@ -890,7 +891,10 @@ def dedupe_keys(job):
     """
     cu = canon_url(job.get("url", ""))
     if cu:
-        return [f"url:{cu}"]
+        keys = [f"url:{cu}"]
+        if job.get("_discovery_url"):
+            keys.append("url:" + canon_url(job["_discovery_url"]))
+        return keys
     nk = name_key(job.get("company", ""), job.get("title", ""), normalize=True)
     location = re.sub(r"\s+", " ", job.get("location", "").strip().casefold())
     return [f"{nk}|{location}"] if nk else []
@@ -1250,50 +1254,7 @@ def _mark_route(con, sub, route, job):
         [(f"route:{sub}:{route}:{key}", now()) for key in dedupe_keys(job)])
 
 
-def is_linkedin_url(url):
-    try:
-        host = (urlsplit(url or '').hostname or '').lower()
-    except ValueError:
-        return False
-    return host == 'linkedin.com' or host.endswith('.linkedin.com')
-
-
-def strip_linkedin_embeds(payload):
-    """Filter restored Discord queues without discarding official jobs in a batch."""
-    kept = []
-    changed = False
-    for original in payload.get('embeds', []):
-        if is_linkedin_url(original.get('url')):
-            changed = True
-            continue
-        embed = dict(original)
-        blocks = []
-        for block in embed.get('description', '').split('\n\n'):
-            lines = block.split('\n')
-            retained = [line for line in lines if not any(
-                is_linkedin_url(url) for url in re.findall(r'https?://[^\s)<>]+', line))]
-            if retained != lines:
-                changed = True
-                # Quiet-feed blocks consist of a company header and job links.
-                if not any(re.search(r'\]\(https?://', line) for line in retained):
-                    continue
-            blocks.append('\n'.join(retained))
-        embed['description'] = '\n\n'.join(blocks)
-        if original.get('description') and not embed['description']:
-            continue
-        kept.append(embed)
-    if changed:
-        payload['embeds'] = kept
-        payload.pop('content', None)  # Old preview text may name a removed job.
-        for embed in kept:
-            if not embed.get('url'):
-                embed['title'] = 'Job discoveries'  # Original counts no longer apply.
-    return payload
-
-
 def notification_match(sub, job):
-    if is_linkedin_url(job.get("url")):
-        return {"feed": False, "ping": False, "reasons": ["LinkedIn discoveries disabled"]}
     policy = sub.get("notification_fit")
     if policy:
         return assess_notification(job, policy, sub.get("watch"))
@@ -1322,6 +1283,8 @@ def deliver(sub, jobs, con):
                  0, job.get("_freshness_note", "")))  # 0 = durable, no freshness expiry
             _mark_route(con, sub["name"], feed_route, job)
             queued += 1
+        else:
+            _mark_route(con, sub["name"], feed_route, job)  # Propagate resolved URL aliases.
         expiry = job.get("_alert_expires_at")
         ping_route = f"ping:{tier}"
         if (expiry and expiry > time.time() and fit["ping"]
@@ -1329,7 +1292,7 @@ def deliver(sub, jobs, con):
             # A separate queue item per job gives each its own expiry; no truncation.
             send_discord_ping("", [(board, job)], "internship" if cat == "intern" else "role",
                 mention=sub["mention"], enqueue=lambda payload: _enqueue(
-                    con, sub["name"], ping_route, dict(payload, _fit_job={
+                    con, sub["name"], ping_route, dict(payload, _freshness_evidence="v2", _fit_job={
                         k: job.get(k, "") for k in ("title", "company", "location")}), expiry))
             _mark_route(con, sub["name"], ping_route, job)
     return queued
@@ -1383,9 +1346,11 @@ def flush_outbox(con, subs, checkpoint=None, budget_seconds=10, max_messages=8):
         if not sub or (name, route) in blocked:
             continue
         payload = json.loads(encoded)
-        if route.startswith(('ping:', 'feed:')) and payload.get('embeds'):
-            payload = strip_linkedin_embeds(payload)
-            if not payload.get('embeds'):
+        evidence = payload.pop('_freshness_evidence', None)
+        if route.startswith('ping:') and evidence != 'v2':
+            embeds = payload.get('embeds', [])
+            if any('Age unverified' in e.get('description', '')
+                   or discovery_verification.linkedin(e.get('url', '')) for e in embeds):
                 con.execute("DELETE FROM outbox WHERE id=?", (key,))
                 con.commit()
                 continue
@@ -1482,8 +1447,6 @@ def flush_feeds(config, con, subs, force=False):
         by_tier = {"intern": [], "ft": []}
         seen = set()
         for tier, ts, company, title, url, location, salary, posted, expires_at, freshness_note in rows:
-            if is_linkedin_url(url):
-                continue
             key = (canon_url(url), company.casefold(), title.casefold())
             if key in seen:     # same job queued twice via near-identical rows
                 continue
@@ -1601,6 +1564,8 @@ def _fetch_board(name, cfg):
         if j["id"] not in seen:
             seen.add(j["id"])
             result.append(j)
+    if cfg["ats"] in DISCOVERY_ONLY_ATS:
+        discovery_verification.enrich(result)
     return name, result
 
 
@@ -1618,14 +1583,21 @@ def alert_freshness(job, cfg, baseline, settings, timestamp):
     hours = settings.get("max_age_hours", 24)
     max_age = hours * 3600
     posted = _posted_epoch(job.get("posted"))
+    first_seen = job.get('_original_seen_at')
+    if first_seen and timestamp - first_seen >= max_age:
+        return None, 'Older posting — previously observed; repost does not reset age'
+    # Discovery dates describe a feed entry or repost, not original publication.
+    if cfg['ats'] in DISCOVERY_ONLY_ATS and not job.get('_official_posted'):
+        observed = job.get('_official_observed_expiry')
+        if observed and observed > timestamp:
+            return observed, 'New on company board · original posting date unavailable'
+        return None, 'Age unverified — discovery/repost date is not original publication'
     if posted is not None:
         age = timestamp - posted
         if age < 0:
             return None, "future posting date"
         if age >= max_age:
             return None, f"Older posting — newly found · {int(age // 86400)} days old"
-        if cfg["ats"] in DISCOVERY_ONLY_ATS and not job.get("_official_posted"):
-            return timestamp + max_age, "Age unverified — may be older (discovery source)"
         return posted + max_age, ""
     if job.get("posted") not in (None, ""):
         return None, "invalid posting date"
@@ -1633,7 +1605,7 @@ def alert_freshness(job, cfg, baseline, settings, timestamp):
             and 0 <= timestamp - baseline.get("checked_at", 0)
             < min(max_age, settings.get("observation_max_gap_hours", 6) * 3600)):
         return baseline["checked_at"] + max_age, "New on company board · original posting date unavailable"
-    return timestamp + max_age, "Age unverified — may be older"
+    return None, "Age unverified — may be older"
 
 
 def remember_publication(con, jobs, cfg, subs):
@@ -1645,18 +1617,32 @@ def remember_publication(con, jobs, cfg, subs):
     for job in jobs:
         if not any(notification_match(sub, job)["feed"] for sub in subs):
             continue
+        seen_key = 'original_seen:' + canon_url(job['url'])
+        if not con.execute("SELECT 1 FROM kv WHERE k=?", (seen_key,)).fetchone():
+            existing = con.execute("SELECT MIN(first_seen) FROM jobs WHERE url IN (?,?)",
+                                   (job['url'], job.get('_discovery_url', job['url']))).fetchone()[0]
+            first_seen = _iso_epoch(existing) if existing else time.time()
+            con.execute("INSERT OR IGNORE INTO kv VALUES (?,?)", (seen_key, str(first_seen or time.time())))
+        job['_original_seen_at'] = float(con.execute("SELECT v FROM kv WHERE k=?", (seen_key,)).fetchone()[0])
         key = "publication:" + canon_url(job["url"])
         saved = con.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
         previous = json.loads(saved[0]) if saved else None
         posted = _posted_epoch(job.get("posted"))
-        if cfg["ats"] not in DISCOVERY_ONLY_ATS and posted and posted <= time.time():
+        if (cfg["ats"] not in DISCOVERY_ONLY_ATS or job.get("_official_posted")) and posted and posted <= time.time():
             if previous:
                 posted = min(posted, previous["posted"])
             previous = {"posted": posted, "seen_at": time.time()}
             con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (key, json.dumps(previous)))
+        observed = con.execute("SELECT v FROM kv WHERE k=?", ('observed:' + canon_url(job['url']),)).fetchone()
+        if observed:
+            job['_official_observed_expiry'] = float(observed[0])
         if previous:
             job["posted"] = previous["posted"]
             job["_official_posted"] = True
+        elif cfg['ats'] in DISCOVERY_ONLY_ATS:
+            job['_source_posted'] = job.get('posted')
+            job['posted'] = None  # Do not display a repost timestamp as job age.
+            job['_official_posted'] = False
 
 
 def expire_notifications(con):
@@ -1784,6 +1770,8 @@ def cycle(config, con, run_seconds=0):
     all_boards = {k: v for k, v in config["boards"].items()
                   if not k.startswith("_") and not v.get("disabled")}
     subs = load_subscribers(config.get("filters", {}))
+    for key, value in con.execute("SELECT k,v FROM kv WHERE k LIKE 'verification:%'"):
+        discovery_verification.CACHE.setdefault(key[len('verification:'):], json.loads(value))
     freshness_settings = config.get("alert_freshness", {})
     expire_notifications(con)
     broke = []
@@ -1846,6 +1834,11 @@ def cycle(config, con, run_seconds=0):
             con.execute("UPDATE boards SET failures=0, last_ok=?, last_error='', next_poll=0 WHERE board=?",
                         (now(), name))
 
+        for job in jobs:
+            verification = job.get('_verification')
+            if verification:
+                con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)",
+                            ('verification:' + verification['source_url'], json.dumps(verification)))
         remember_publication(con, jobs, due[name], subs)
         fresh = [j for j in jobs if j["id"] and j["id"] not in known]
         fresh_ids = {j["id"] for j in fresh}
@@ -1853,6 +1846,9 @@ def cycle(config, con, run_seconds=0):
             expiry, note = alert_freshness(j, due[name], baseline, freshness_settings, time.time())
             j["_alert_expires_at"] = expiry
             j["_freshness_note"] = note
+            if expiry and 'New on company board' in note and due[name]['ats'] not in DISCOVERY_ONLY_ATS:
+                con.execute("INSERT OR IGNORE INTO kv VALUES (?,?)",
+                            ('observed:' + canon_url(j['url']), str(expiry)))
         if not warnings:
             con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (baseline_key, json.dumps({
                 "signature": _collection_signature(due[name]), "checked_at": time.time()})))
@@ -1881,6 +1877,9 @@ def cycle(config, con, run_seconds=0):
         if not warnings:
             con.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (signature_key, _collection_signature(due[name])))
         if not seeded or changed:
+            if due[name]['ats'] in DISCOVERY_ONLY_ATS:
+                con.executemany("INSERT OR IGNORE INTO kv VALUES (?,?)",
+                    [(f"discovery_baseline:{name}:{j['id']}", '1') for j in jobs])
             log(f"  {name}: seeded {len(jobs)} postings silently")
         elif seeded:
             total_new += len(fresh)
@@ -1898,7 +1897,11 @@ def cycle(config, con, run_seconds=0):
             for job in jobs:
                 if job["id"] not in fresh_ids:
                     posted = _posted_epoch(job.get("posted"))
-                    if (not any(catchup.values()) or due[name]["ats"] in DISCOVERY_ONLY_ATS
+                    verified_discovery = (due[name]['ats'] in DISCOVERY_ONLY_ATS
+                                          and (job.get('_official_posted') or job.get('_official_observed_expiry'))
+                                          and not con.execute("SELECT 1 FROM kv WHERE k=?",
+                                              (f"discovery_baseline:{name}:{job['id']}",)).fetchone())
+                    if not verified_discovery and (not any(catchup.values()) or due[name]["ats"] in DISCOVERY_ONLY_ATS
                             or not posted or not 0 <= time.time() - posted < freshness_settings.get("max_age_hours", 24) * 3600):
                         continue
                     job["_alert_expires_at"], job["_freshness_note"] = alert_freshness(
@@ -1911,7 +1914,8 @@ def cycle(config, con, run_seconds=0):
                 if "all" not in sub["companies"] and name not in sub["companies"]:
                     continue
                 mine = [(name, job) for job in keep
-                        if (job["id"] in fresh_ids or catchup.get(sub["name"])) and notification_match(sub, job)["feed"]]
+                        if (job["id"] in fresh_ids or catchup.get(sub["name"]) or
+                            (due[name]["ats"] in DISCOVERY_ONLY_ATS and job.get("_alert_expires_at"))) and notification_match(sub, job)["feed"]]
                 queued = deliver(sub, mine, con)
                 delivered += queued
                 deduped += len(mine) - queued

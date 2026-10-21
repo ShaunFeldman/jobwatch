@@ -41,45 +41,6 @@ class FourChannelTests(unittest.TestCase):
         with patch('watcher.fetch_board', return_value=('pinterest', watcher.FetchResult(rows))), patch('watcher.flush_outbox'):
             watcher.cycle({'boards': {'pinterest': cfg}}, self.con)
 
-    def test_linkedin_discoveries_never_queue_either_channel(self):
-        for url in ('https://www.linkedin.com/jobs/view/123', 'https://ca.linkedin.com/jobs/view/456'):
-            row = job(company='Pinterest', url=url, _alert_expires_at=time.time()+3600)
-            watcher.deliver(self.sub, [('community', row)], self.con)
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
-        # Rejecting a repost must not mark the employer's job as delivered.
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM alerted').fetchone()[0])
-
-    def test_restored_linkedin_ping_is_removed_without_sending(self):
-        watcher._enqueue(self.con, self.sub['name'], 'ping:intern', {'embeds': [{
-            'title': 'Pinterest — Software Engineer Intern',
-            'url': 'https://www.linkedin.com/jobs/view/123'}]}, time.time()+3600)
-        with patch('watcher.requests.post') as post:
-            watcher.flush_outbox(self.con, [self.sub])
-        post.assert_not_called()
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
-
-    def test_mixed_queued_feed_keeps_official_links(self):
-        payload = {'content': '2 new jobs', 'embeds': [{
-            'title': '2 new internships',
-            'description': '**Pinterest**\n[Intern](https://www.linkedin.com/jobs/view/123)\n'
-                           '[Engineer](https://careers.pinterest.com/jobs/456)\n\n'
-                           '**Other**\n[Intern](https://ca.linkedin.com/jobs/view/789)'}]}
-        filtered = watcher.strip_linkedin_embeds(payload)
-        self.assertNotIn('linkedin.com', json.dumps(filtered))
-        self.assertNotIn('**Other**', json.dumps(filtered))
-        self.assertIn('careers.pinterest.com', json.dumps(filtered))
-        self.assertNotIn('content', filtered)
-        self.assertEqual('Job discoveries', filtered['embeds'][0]['title'])
-
-    def test_restored_pending_linkedin_feed_is_removed(self):
-        self.con.execute('INSERT INTO pending VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-            (self.sub['name'], 'intern', watcher.now(), 'Pinterest', 'Software Engineer Intern',
-             'https://www.linkedin.com/jobs/view/123', 'NYC', '', None, 0, ''))
-        watcher.flush_feeds({}, self.con, [self.sub], force=True)
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
-        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
-
     def test_new_intern_goes_to_both_channels_only_important_notifies(self):
         self.seed('pinterest')
         self.collect([job(company='Pinterest', posted=time.time()-60)])

@@ -46,9 +46,12 @@ contact details are not stored in this repository.
 - Official postings published within 24 hours can ping. Edit dates do not count.
 - Undated jobs absent from a recent complete company-board snapshot say
   **New on company board · original posting date unavailable**.
-- Other newly discovered undated jobs and recent discovery-feed entries can
-  ping with **Age unverified — may be older**. LinkedIn repost dates never
-  certify original publication.
+- LinkedIn and community timestamps never certify original publication. Unknown-age
+  discoveries stay in quiet feeds; only verified original dates or recent complete
+  company-board observations can justify pings. LinkedIn external apply links are
+  resolved in bounded batches, using matching employer JobPosting structured data
+  when available. Blocked pages, Easy Apply, missing dates, and unsupported pages
+  remain visible without a ping. Verified links and dates persist across restarts.
 - Known postings older than 24 hours appear only in full feeds, labeled
   **Older posting — newly found** with their age at discovery.
 - First baselines, including incomplete first reads, are silent. Collection
@@ -151,7 +154,3 @@ ranking, saved jobs, application notes, and source health. It uses its own
 SQLite data; GitHub's notification state is not a hosted dashboard sync.
 Application notes never enter the public state branch. The server binds to
 loopback and has no authentication; keep it local.
-
-LinkedIn searches are disabled: repost dates do not establish a new opening.
-LinkedIn links are excluded from both Discord tiers, including restored queues;
-official employer postings and community listings with employer links remain enabled.
