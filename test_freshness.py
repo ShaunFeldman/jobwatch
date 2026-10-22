@@ -203,6 +203,24 @@ class FreshnessIntegrationTests(unittest.TestCase):
         self.assertIsNone(posted)
         self.assertIn('unverified', note)
 
+    def test_jobright_just_posted_is_quiet_and_old_employer_evidence_wins(self):
+        self.seed_board()
+        cfg = {'ats': 'github_md', 'min_interval': 0}
+        wrapper = dict(job('jobright', NOW-60), url='https://jobright.ai/jobs/info/123')
+        self.run_cycle([wrapper], cfg)
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        posted, note = self.con.execute('SELECT posted,freshness_note FROM pending').fetchone()
+        self.assertIsNone(posted)
+        self.assertIn('unverified', note)
+        original = job('employer', NOW-10*86400)
+        watcher.remember_publication(self.con, [original], DIRECT, [subscriber()])
+        resolved = dict(job('jobright', NOW-60), url=original['url'],
+                        _discovery_url=wrapper['url'])
+        self.run_cycle([resolved], cfg)
+        self.assertEqual(NOW-10*86400, resolved['posted'])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
     def test_legacy_unverified_ping_is_retired_but_quiet_feed_is_kept(self):
         payload = {'embeds': [{'title': 'Example — Intern',
                               'url': 'https://www.linkedin.com/jobs/view/123',

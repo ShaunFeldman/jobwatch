@@ -42,6 +42,19 @@ class VerificationTests(unittest.TestCase):
         self.assertIsNone(verification.official_date(self.page.replace('Intern', 'Manager'), self.official, self.job))
         self.assertIsNone(verification.official_date(self.page.replace('datePosted', 'dateModified'), self.official, self.job))
 
+    def test_jobright_fresh_date_never_certifies_original_publication(self):
+        for company in ('Example', 'Jobright'):
+            with self.subTest(company=company):
+                self.assertIsNone(verification.official_date(
+                    self.page, 'https://jobright.ai/jobs/info/123', dict(self.job, company=company)))
+
+    def test_jobright_redirect_to_linkedin_does_not_verify_repost_date(self):
+        row = dict(self.job, url='https://jobright.ai/jobs/info/123')
+        with patch.object(verification, '_get', return_value=(self.job['url'], self.page)):
+            verification.enrich([row])
+        self.assertFalse(row.get('_official_posted', False))
+        self.assertNotIn('posted', row['_verification'])
+
     def test_community_employer_link_is_verified_without_linkedin_request(self):
         self.job['url'] = self.official
         with patch.object(verification, '_get', return_value=(self.official, self.page)) as get:

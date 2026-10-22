@@ -62,6 +62,10 @@ def _normalized(value):
 
 def official_date(text, url, job):
     host = (urlsplit(url).hostname or '').lower()
+    # Aggregators never establish original publication, even if a scraped
+    # company name accidentally matches the aggregator's own domain.
+    if linkedin(url) or host == 'jobright.ai' or host.endswith('.jobright.ai'):
+        return None
     company = _normalized(re.sub(r'\b(inc|corp|corporation|llc|ltd)\b', '',
                                 job.get('company', ''), flags=re.I))
     employer_host = len(company) >= 4 and company in host.split('.')[:-1]
