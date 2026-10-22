@@ -736,6 +736,9 @@ def db_open(path=None):
         started_at TEXT, finished_at TEXT, ok_count INTEGER, fail_count INTEGER,
         skipped_count INTEGER, new_count INTEGER, deduped_count INTEGER,
         delivered_count INTEGER, duration REAL)""")
+    if not con.execute("SELECT 1 FROM kv WHERE k='recent_unique_v1'").fetchone():
+        con.execute("DELETE FROM recent WHERE rowid NOT IN (SELECT MIN(rowid) FROM recent GROUP BY url)")
+        con.execute("INSERT INTO kv VALUES ('recent_unique_v1','1')")
     con.execute("CREATE INDEX IF NOT EXISTS jobs_last_seen ON jobs(last_seen)")
     con.execute("CREATE INDEX IF NOT EXISTS details_posted ON job_details(posted)")
     con.execute("CREATE INDEX IF NOT EXISTS applications_status ON applications(status)")
@@ -801,6 +804,10 @@ def export_state(con):
 
 def import_state(con):
     state = json.loads(STATE_JSON.read_text())
+    recent_by_url = {}
+    for row in state.get("recent", []):
+        recent_by_url.setdefault(row[3], row)
+    state["recent"] = list(recent_by_url.values())
     ts = now()
     for board, b in state.get("boards", {}).items():
         con.execute(
@@ -1920,6 +1927,8 @@ def cycle(config, con, run_seconds=0):
                 delivered += queued
                 deduped += len(mine) - queued
             for job in keep:
+                if job["id"] not in fresh_ids:
+                    continue  # Reverification is not another discovery-history event.
                 con.execute("INSERT INTO recent VALUES (?,?,?,?,?,?)",
                     (now(), job.get("company") or name, job["title"], job["url"],
                      job.get("location") or "", job.get("salary") or ""))

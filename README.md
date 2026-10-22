@@ -107,7 +107,10 @@ next run. A ten-minute cron schedule restarts broken chains. No extra hosting
 account is required.
 
 Failed downloads never masquerade as a fresh installation. State push failures
-stop the run visibly, with a seven-day recovery artifact. The `state` branch
+stop the run visibly, with a seven-day recovery artifact. Startup automatically
+recovers a newer artifact before sending. Checkpoints are gzip-compressed in a
+single parentless state commit, avoiding GitHub’s 100 MB per-file limit and
+accumulated snapshot history. Legacy uncompressed checkpoints remain readable. The `state` branch
 contains seen IDs, per-channel deduplication, queues, and health. Schema v5 reads
 older state versions; v4 full-feed queues lose their freshness expiry, while
 legacy queues with no expiry metadata are retired. Existing job/application

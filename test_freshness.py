@@ -151,6 +151,7 @@ class FreshnessIntegrationTests(unittest.TestCase):
         self.run_cycle([dict(verified)], {'ats': 'linkedin', 'min_interval': 0})
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
         self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM recent').fetchone()[0])
         # Subsequent direct-board discovery is deduplicated in both channels.
         self.con.execute("INSERT INTO boards(board,seeded) VALUES ('company',1)")
         with patch('watcher.fetch_board', return_value=('company', watcher.FetchResult([job('official', NOW-60)]))), patch('watcher.flush_outbox'):
