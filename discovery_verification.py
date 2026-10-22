@@ -60,6 +60,31 @@ def _normalized(value):
     return re.sub(r'[^a-z0-9]', '', (value or '').lower())
 
 
+def greenhouse_reference(url):
+    parsed = urlsplit(url)
+    if parsed.hostname in ('boards.greenhouse.io', 'job-boards.greenhouse.io'):
+        match = re.fullmatch(r'/([\w-]+)/jobs/(\d+)/?', parsed.path)
+        return match.groups() if match else None
+    if parsed.hostname == 'zapply.jobs':
+        match = re.fullmatch(r'/l/d/greenhouse-([\w-]+)-(\d+)/?', parsed.path)
+        return match.groups() if match else None
+    return None
+
+
+def greenhouse_evidence(url, job):
+    reference = greenhouse_reference(url)
+    if not reference:
+        return None
+    board, job_id = reference
+    _, text = _get(f'https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{job_id}')
+    data = json.loads(text)
+    if str(data.get('id')) != job_id or _normalized(data.get('title')) != _normalized(job.get('title')):
+        return None
+    # first_published is authoritative; updated_at is deliberately ignored.
+    return {'url': f'https://job-boards.greenhouse.io/{board}/jobs/{job_id}',
+            'posted': data.get('first_published')}
+
+
 def official_date(text, url, job):
     host = (urlsplit(url).hostname or '').lower()
     # Aggregators never establish original publication, even if a scraped
@@ -115,11 +140,16 @@ def enrich(jobs, max_requests=4, budget_seconds=15):
                     _, detail = _get('https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/' + job['id'])
                     target = employer_link(detail)
                 if target:
-                    url, text = _get(target)
-                    if not linkedin(url):
-                        cached.update(url=url, posted=official_date(text, url, job))
-                        if cached['posted']:
-                            cached['retry_at'] = time.time() + 86400
+                    evidence = greenhouse_evidence(target, job)
+                    if evidence:
+                        cached.update(evidence)
+                    else:
+                        url, text = _get(target)
+                        if not linkedin(url):
+                            evidence = greenhouse_evidence(url, job)
+                            cached.update(evidence or {'url': url, 'posted': official_date(text, url, job)})
+                    if cached.get('posted'):
+                        cached['retry_at'] = time.time() + 86400
             except (requests.RequestException, ValueError, OSError, KeyError):
                 pass  # Verification failures retain the discovery, without a ping.
             CACHE[source_url] = cached

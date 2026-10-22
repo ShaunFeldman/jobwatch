@@ -32,6 +32,9 @@
   },
 
   "boards": {
+    "twitch": {"ats": "greenhouse", "token": "twitch", "company": "Twitch", "min_interval": 180,
+               "recover_job_ids": ["8886748002", "8886605002"],
+               "_note": "Direct coverage; recover only these reported new internships if still within the freshness window. Other baseline jobs remain silent."},
     "_quant_and_trading": "----------------------------------------",
     "jump_trading":   { "ats": "greenhouse", "token": "jumptrading" },
     "hrt":            { "ats": "greenhouse", "token": "wehrtyou" },

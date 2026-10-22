@@ -70,6 +70,27 @@ class VerificationTests(unittest.TestCase):
             verification.enrich(rows, max_requests=2)
             self.assertEqual(4, get.call_count)
 
+    def test_greenhouse_wrappers_use_first_published_not_edit_time(self):
+        row = dict(self.job, url='https://zapply.jobs/l/d/greenhouse-twitch-8886748002?s=gh',
+                   title='Undergrad Software Engineering Intern (Grad Year: Spring 2028)')
+        data = {'id': 8886748002, 'title': row['title'], 'first_published': '2026-10-22T15:17:18-04:00',
+                'updated_at': '2026-10-22T18:00:00-04:00'}
+        with patch.object(verification, '_get', return_value=('', json.dumps(data))) as get:
+            verification.enrich([row])
+        get.assert_called_once_with('https://boards-api.greenhouse.io/v1/boards/twitch/jobs/8886748002')
+        self.assertEqual(data['first_published'], row['posted'])
+        self.assertTrue(row['_official_posted'])
+        self.assertEqual('https://job-boards.greenhouse.io/twitch/jobs/8886748002', row['url'])
+
+    def test_jobright_redirect_to_fresh_employer_posting_can_verify(self):
+        row = dict(self.job, url='https://jobright.ai/jobs/info/123')
+        official = 'https://job-boards.greenhouse.io/example/jobs/456'
+        data = {'id': 456, 'title': row['title'], 'first_published': '2026-10-22T15:17:18-04:00'}
+        with patch.object(verification, '_get', side_effect=[(official, ''), ('', json.dumps(data))]):
+            verification.enrich([row])
+        self.assertTrue(row['_official_posted'])
+        self.assertEqual(data['first_published'], row['posted'])
+
     def test_private_application_addresses_are_rejected(self):
         with patch.object(verification.socket, 'getaddrinfo', return_value=[(2, 1, 6, '', ('127.0.0.1', 443))]), patch.object(verification.requests, 'get') as get:
             with self.assertRaises(ValueError):

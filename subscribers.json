@@ -33,7 +33,7 @@
       "replay_on_change": false,
       "ping_locations": "\\b(new york|nyc|manhattan|brooklyn|jersey city|san francisco|sf|bay area|palo alto|menlo park|mountain view|sunnyvale|redwood city|san jose|los gatos|san mateo|cupertino|oakland|berkeley|toronto)\\b",
       "location_exception_companies": "^(?:citadel(?: securities)?|jane street|hudson river trading|hrt|jump trading|d\\.?\\s*e\\.?\\s*shaw|google|google deepmind|deepmind|meta|meta platforms|apple|netflix|nvidia|openai|anthropic|stripe|databricks|figma|palantir(?: technologies)?)(?:,? inc\\.?)?$",
-      "technical_location_companies": "^(?:docusign|adobe|salesforce|atlassian|microsoft|amazon(?: web services)?|aws|pinterest|shopify|spotify|snap(?: inc\\.?)?|reddit|discord|duolingo|dropbox|twilio|instacart|ebay|linkedin|snowflake|cloudflare|datadog|mongodb|gitlab|airbnb|uber|lyft|doordash|roblox|coinbase|ramp|plaid|robinhood|block|bloomberg|confluent|hashicorp|autodesk|servicenow|workday|hubspot|intuit|cisco|qualcomm|amd|intel)(?:,? (?:inc\\.?|corporation|technologies))?$"
+      "technical_location_companies": "^(?:twitch(?: interactive)?|docusign|adobe|salesforce|atlassian|microsoft|amazon(?: web services)?|aws|pinterest|shopify|spotify|snap(?: inc\\.?)?|reddit|discord|duolingo|dropbox|twilio|instacart|ebay|linkedin|snowflake|cloudflare|datadog|mongodb|gitlab|airbnb|uber|lyft|doordash|roblox|coinbase|ramp|plaid|robinhood|block|bloomberg|confluent|hashicorp|autodesk|servicenow|workday|hubspot|intuit|cisco|qualcomm|amd|intel)(?:,? (?:inc\\.?|corporation|technologies))?$"
     }
   },
   "friend_example": {

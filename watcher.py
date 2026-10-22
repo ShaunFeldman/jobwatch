@@ -852,6 +852,9 @@ def import_state(con):
 def canon_url(url):
     if not url:
         return ""
+    greenhouse = discovery_verification.greenhouse_reference(url)
+    if greenhouse:
+        return f"job-boards.greenhouse.io/{greenhouse[0]}/jobs/{greenhouse[1]}"
     p = urlsplit(html.unescape(url.strip()))
     host = p.netloc.lower().removeprefix("www.")
     path = p.path.rstrip("/")
@@ -1888,6 +1891,16 @@ def cycle(config, con, run_seconds=0):
                 con.executemany("INSERT OR IGNORE INTO kv VALUES (?,?)",
                     [(f"discovery_baseline:{name}:{j['id']}", '1') for j in jobs])
             log(f"  {name}: seeded {len(jobs)} postings silently")
+            # Explicit recovery for user-reported misses. Never replay the
+            # whole baseline, undated records, or already-stale postings.
+            recovery_ids = set(due[name].get('recover_job_ids', []))
+            if recovery_ids and due[name]['ats'] not in DISCOVERY_ONLY_ATS:
+                recovered = [(name, job) for job in fresh
+                             if job['id'] in recovery_ids and job.get('_alert_expires_at')
+                             and _posted_epoch(job.get('posted')) is not None]
+                for sub in subs:
+                    if 'all' in sub['companies'] or name in sub['companies']:
+                        deliver(sub, recovered, con)
         elif seeded:
             total_new += len(fresh)
             # A preference update may recover a missed fresh official posting,

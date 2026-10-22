@@ -203,6 +203,21 @@ class FreshnessIntegrationTests(unittest.TestCase):
         self.assertIsNone(posted)
         self.assertIn('unverified', note)
 
+    def test_explicit_recovery_only_notifies_named_fresh_dated_jobs(self):
+        cfg = dict(DIRECT, recover_job_ids=['reported', 'old', 'undated'])
+        self.run_cycle([job('reported', NOW-60), job('old', NOW-864000), job('undated'), job('other', NOW-60)], cfg)
+        self.run_cycle([job('reported', NOW-60), job('old', NOW-864000), job('undated'), job('other', NOW-60)], cfg)
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
+    def test_fresh_verified_jobright_posting_reaches_important_channel(self):
+        self.seed_board()
+        row = dict(job('jobright', NOW-60), _official_posted=True,
+                   _discovery_url='https://jobright.ai/jobs/info/123')
+        self.run_cycle([row], {'ats': 'github_md', 'min_interval': 0})
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+
     def test_jobright_just_posted_is_quiet_and_old_employer_evidence_wins(self):
         self.seed_board()
         cfg = {'ats': 'github_md', 'min_interval': 0}

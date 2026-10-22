@@ -169,3 +169,11 @@ This covers Jobright's public GitHub lists, not the complete personalized
 Duplicate Jobright URLs are normalized across categories and tracking parameters.
 Employer-site duplicates can only be merged once a common application URL is
 available; unresolved Jobright wrappers remain unverified, quiet discoveries.
+
+Twitch is polled directly through Greenhouse every three minutes. Discovery
+verification also reads Greenhouse `first_published` from exact requisition URLs
+(including encoded Zapply links), rather than relying on HTML dates. Jobright
+or LinkedIn discovery does not disqualify a job: verified new original postings
+can ping. Unresolvable links remain quiet. Explicit `recover_job_ids` may recover
+specified fresh, dated postings during a source baseline; no general backlog is
+replayed.

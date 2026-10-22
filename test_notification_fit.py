@@ -22,6 +22,7 @@ def job(title, company='Netflix', location='New York, NY', jid='1', posted=None)
 class FitTests(unittest.TestCase):
     def test_interest_examples(self):
         cases = [
+            ('Undergrad Software Engineering Intern (Grad Year: Spring 2028)', 'Twitch', 'San Francisco, CA', True),
             ('Software Engineer', 'Palantir', 'Palo Alto, CA', True),
             ('Software Engineer L3', 'Netflix', 'Los Gatos, CA', True),
             ('Software Engineer, New Grad', 'Palantir', 'Washington, D.C.', True),
