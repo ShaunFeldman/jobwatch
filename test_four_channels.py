@@ -41,6 +41,15 @@ class FourChannelTests(unittest.TestCase):
         with patch('watcher.fetch_board', return_value=('pinterest', watcher.FetchResult(rows))), patch('watcher.flush_outbox'):
             watcher.cycle({'boards': {'pinterest': cfg}}, self.con)
 
+    def test_jobright_duplicate_categories_share_one_quiet_discovery(self):
+        for source in ('swe', 'data'):
+            row = job(company='Pinterest', url='https://jobright.ai/jobs/info/abc?utm_source=' + source)
+            row['_alert_expires_at'], row['_freshness_note'] = watcher.alert_freshness(
+                row, {'ats': 'github_md'}, None, {}, time.time())
+            watcher.deliver(self.sub, [('jobright_' + source, row)], self.con)
+        self.assertEqual(1, self.con.execute('SELECT COUNT(*) FROM pending').fetchone()[0])
+        self.assertEqual(0, self.con.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+
     def test_new_intern_goes_to_both_channels_only_important_notifies(self):
         self.seed('pinterest')
         self.collect([job(company='Pinterest', posted=time.time()-60)])

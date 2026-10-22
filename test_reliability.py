@@ -120,6 +120,18 @@ class ListingTests(unittest.TestCase):
         with patch('watcher.requests.get', return_value=Mock(text=text)):
             return watcher.fetch_github_md({'repo': 'test/test', 'cols': {'company': 0, 'title': 1, 'location': 2, 'url': 6}})
 
+    def test_jobright_title_links_continuations_and_unverified_dates(self):
+        rows = self.parse(
+            '| Company | Job Title | Location | Work Model | Date Posted |\n'
+            '| ----- | --------- | --------- | ---- | ------- |\n'
+            '| **[NVIDIA](https://www.nvidia.com)** | **[NVIDIA 2027 Internships: Software Engineering](https://jobright.ai/jobs/info/abc?utm_source=git)** | Santa Clara, CA | On Site | Oct 22 |\n'
+            '| ↳ | **[Systems Software Intern](https://jobright.ai/jobs/info/def)** | Toronto | Hybrid | Oct 22 |')
+        self.assertEqual(2, len(rows))
+        self.assertEqual(['NVIDIA', 'NVIDIA'], [row['company'] for row in rows])
+        self.assertTrue(all(row['url'].startswith('https://jobright.ai/jobs/info/') for row in rows))
+        self.assertTrue(all(row.get('posted') is None for row in rows))
+        self.assertNotEqual(watcher.dedupe_keys(rows[0]), watcher.dedupe_keys(rows[1]))
+
     def test_reordered_header_and_multiple_requisitions(self):
         rows = self.parse('| Company | Role | Apply | Location |\n|---|---|---|---|\n| Demo | SWE Intern | [Apply](https://x/1) [#2](https://x/2) | Toronto |')
         self.assertEqual(2, len(rows))

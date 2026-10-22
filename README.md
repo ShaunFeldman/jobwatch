@@ -157,3 +157,15 @@ ranking, saved jobs, application notes, and source health. It uses its own
 SQLite data; GitHub's notification state is not a hosted dashboard sync.
 Application notes never enter the public state branch. The server binds to
 loopback and has no authentication; keep it local.
+
+### Jobright discovery
+
+Eight public Jobright feeds cover software engineering, data analysis, business
+analysis, and product management internships/new-grad roles. They are checked
+approximately every 15 minutes, with silent initial baselines. Their repository
+names still say 2026 but contain 2027 openings; titles determine matching.
+This covers Jobright's public GitHub lists, not the complete personalized
+`/jobs/recommend` account feed. Jobright listing dates do not certify freshness.
+Duplicate Jobright URLs are normalized across categories and tracking parameters.
+Employer-site duplicates can only be merged once a common application URL is
+available; unresolved Jobright wrappers remain unverified, quiet discoveries.
